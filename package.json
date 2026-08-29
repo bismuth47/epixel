@@ -1,0 +1,16 @@
+{
+  "name": "everyone-draw",
+  "version": "1.0.0",
+  "description": "Everyone Draw clone - infinite collaborative pixel canvas",
+  "type": "commonjs",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "migrate": "node migrate-to-supabase.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.112.4",
+    "express": "^4.19.2",
+    "socket.io": "^4.7.5"
+  }
+}
