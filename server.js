@@ -421,7 +421,7 @@ io.on("connection", (socket) => {
       pendingUpserts.set(key, normalized);
       if (!supabase) dirty = true;
     }
-    io.emit("draw", { x, y, color: normalized });
+    io.emit("draw", { x, y, color: normalized, totalPixels: canvasData.size });
   });
 
   socket.on("drawBatch", (data) => {
@@ -443,7 +443,7 @@ io.on("connection", (socket) => {
       normalizedBatch.push({ x, y, color: normalized });
     }
     if (!supabase) dirty = true;
-    io.emit("drawBatch", normalizedBatch);
+    io.emit("drawBatch", { pixels: normalizedBatch, totalPixels: canvasData.size });
   });
 
   socket.on("disconnect", () => {

@@ -197,6 +197,7 @@
   let selectedColor = COLORS[0];
   const pixels = new Map(); // gx -> Map<gy,color> (A: no string key)
   let pixelCount = 0;
+  let worldPixelCount = 0;
   const tilePixels = new Map(); // tileKey -> Map<"x,y",color> for B: viewport culling via tiles
   function tileKeyFor(x,y){ return `${Math.floor(x/TILE)},${Math.floor(y/TILE)}`; }
   function getPixel(x,y){ const col=pixels.get(x); return col ? col.get(y) : undefined; }
@@ -1219,7 +1220,7 @@
     if (hoverGrid) coordEl.textContent = `${hoverGrid.x}, ${hoverGrid.y}`;
     else coordEl.textContent = `${Math.floor(offsetX/PIXEL_SIZE)}, ${Math.floor(offsetY/PIXEL_SIZE)}`;
     zoomEl.textContent = Math.round(scale * 100) + "%";
-    pixCountEl.textContent = pixelCount;
+    pixCountEl.textContent = worldPixelCount;
   }
 
   // ---- Draw ops (with local undo tracking) ----
@@ -1898,7 +1899,10 @@
     connTextEl.textContent = "切断";
   });
   socket.on("ready", (info) => {
-    if(info && typeof info.pixels==="number") pixCountEl.textContent = info.pixels;
+    if(info && typeof info.pixels==="number") {
+      worldPixelCount = info.pixels;
+      pixCountEl.textContent = info.pixels;
+    }
     if(!initialLoaded) fetchViewport(true);
   });
   socket.on("init", (data) => {
@@ -1906,22 +1910,33 @@
     if(data && typeof data === "object" && Object.keys(data).length>0){
       for (const [k, v] of Object.entries(data)) { const [px,py]=k.split(',').map(Number); setPixel(px,py, v); }
       undoStack=[]; redoStack=[]; updateUndoUI();
+      worldPixelCount = pixelCount;
       initialLoaded = true;
       hideLoading();
       scheduleRender(); updateInfo();
     }
   });
-  socket.on("draw", ({ x, y, color }) => {
+  socket.on("draw", (info) => {
+    const { x, y, color, totalPixels } = info;
     const normalized = color.toLowerCase();
     if (normalized === ERASER_COLOR) {
       deletePixel(x,y);
     } else {
       setPixel(x,y, normalized);
     }
+    if(typeof totalPixels === "number") worldPixelCount = totalPixels;
     scheduleRender(); updateInfo();
   });
-  socket.on("drawBatch", (arr) => {
-    if(!Array.isArray(arr)) return;
+  socket.on("drawBatch", (data) => {
+    let arr;
+    if(Array.isArray(data)){
+      arr = data;
+    } else if(data && Array.isArray(data.pixels)){
+      arr = data.pixels;
+      if(typeof data.totalPixels === "number") worldPixelCount = data.totalPixels;
+    } else {
+      return;
+    }
     for(const {x,y,color} of arr){
       const normalized = (color||'').toLowerCase();
       if(!Number.isInteger(x) || !Number.isInteger(y)) continue;
