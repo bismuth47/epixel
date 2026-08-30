@@ -1056,8 +1056,8 @@
     const maxGridY = Math.floor(maxWorldY / PIXEL_SIZE) + 1;
 
     const canDrawGrid = isGridVisible();
-    // グリッド表示時のみピクセル間に小隙間を空けてグリッド線が見えるようにする
-    const pad = canDrawGrid ? -0.4 / scale : 0.6 / scale;
+    // ピクセル間にオーバーラップを設けてグリッド線を隠す（ズーム時のみグリッド描画）
+    const pad = 0.6 / scale;
 
     // グリッド描画（不透明度倍率を指定）: ピクセル前は通常不透明度、ピクセル上は低不透明度
     const drawGrid = (alphaMult) => {
