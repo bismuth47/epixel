@@ -150,8 +150,8 @@
   const MAX_SCALE = 30;
   
   // ズームインで他ツールが使用可になるまでグリッドを非表示
-  const GRID_SHOW_THRESHOLD = 28; // CSS px per dot（18 -> 28に変更: より寄らないと表示しない）
-  const MAX_GRID_LINES_PER_AXIS = 50;  // 片軸あたりの最大線本数（80 -> 50に変更）
+  const GRID_SHOW_THRESHOLD = 14; // CSS px per dot（28 -> 14: 少しズームアウトしてもグリッドを表示）
+  const MAX_GRID_LINES_PER_AXIS = 400;  // 片軸あたりの最大線本数（50 -> 400: 大画面ズームアウト時も描画）
 
   const COLORS = [
     "#175145","#2e8065","#51b341","#9bd547","#fff971","#ff7f4f",
@@ -171,15 +171,24 @@
     [TOOLS.LINE]: '直線',
     [TOOLS.SPoit]: 'スポイト'
   };
-  const TOOL_ICONS = {
-    [TOOLS.DOT]: '・',
-    [TOOLS.PEN]: '✎',
-    [TOOLS.RECT]: '□',
-    [TOOLS.CIRCLE]: '○',
-    [TOOLS.FILL]: '▨',
-    [TOOLS.LINE]: '╱',
-    [TOOLS.SPoit]: '⊙'
-  };
+   const TOOL_ICONS = {
+     [TOOLS.DOT]: '・',
+     [TOOLS.PEN]: '✎',
+     [TOOLS.RECT]: '□',
+     [TOOLS.CIRCLE]: '○',
+     [TOOLS.FILL]: '▨',
+     [TOOLS.LINE]: '╱',
+     [TOOLS.SPoit]: '⊙'
+   };
+   const TOOL_SHORTCUTS = {
+     [TOOLS.DOT]: 'p',
+     [TOOLS.PEN]: 'b',
+     [TOOLS.RECT]: 's',
+     [TOOLS.CIRCLE]: 'c',
+     [TOOLS.FILL]: 'g',
+     [TOOLS.LINE]: 'l',
+     [TOOLS.SPoit]: 'Alt'
+   };
   const FILL_LIMIT = 10000;
 
   // ---- State ----
@@ -475,15 +484,17 @@
     sep0.className = "sep";
     toolBar.appendChild(sep0);
 
-    Object.values(TOOLS).forEach(tool=>{
-      const btn = document.createElement("button");
-      btn.className = "toolBtn";
-      btn.dataset.tool = tool;
-      btn.textContent = TOOL_ICONS[tool];
-      btn.title = TOOL_LABELS[tool] + (tool!==TOOLS.DOT && tool!==TOOLS.SPoit ? " (グリッド表示時のみ)" : " (常時使用可)");
-      btn.onclick = ()=> selectTool(tool);
-      toolBar.appendChild(btn);
-    });
+     Object.values(TOOLS).forEach(tool=>{
+       const btn = document.createElement("button");
+       btn.className = "toolBtn";
+       btn.dataset.tool = tool;
+       btn.textContent = TOOL_ICONS[tool];
+       const shortcut = TOOL_SHORTCUTS[tool];
+       const shortcutText = shortcut ? ` (${shortcut})` : "";
+       btn.title = TOOL_LABELS[tool] + shortcutText + (tool!==TOOLS.DOT && tool!==TOOLS.SPoit ? " (グリッド表示時のみ)" : " (常時使用可)");
+       btn.onclick = ()=> selectTool(tool);
+       toolBar.appendChild(btn);
+     });
     const sep = document.createElement("div");
     sep.className = "sep";
     toolBar.appendChild(sep);
@@ -575,13 +586,13 @@
         text = "ズームインで他ツールが使用可";
       } else {
         switch(currentTool){
-          case TOOLS.DOT: text = "ドラッグで移動、クリックで1ドット"; break;
-          case TOOLS.PEN: text = "ドラッグで連続描画"; break;
-          case TOOLS.RECT: text = shapeFilled ? "ドラッグで塗り四角" : "ドラッグで枠線四角"; break;
-          case TOOLS.CIRCLE: text = shapeFilled ? "ドラッグで塗り楕円 (Shift:正円)" : "ドラッグで枠線楕円 (Shift:正円)"; break;
-          case TOOLS.FILL: text = "クリックで塗りつぶし"; break;
-          case TOOLS.LINE: text = shiftDown ? "直線 (22.5°スナップ中)" : "ドラッグで直線 (Shift:22.5°スナップ)"; break;
-          case TOOLS.SPoit: text = "クリックでピクセルの色を取得、前のツールに戻る"; break;
+          case TOOLS.DOT: text = "ドラッグで移動、クリックで1ドット (p)"; break;
+          case TOOLS.PEN: text = "ドラッグで連続描画 (b)"; break;
+          case TOOLS.RECT: text = shapeFilled ? "ドラッグで塗り四角 (s)" : "ドラッグで枠線四角 (s)"; break;
+          case TOOLS.CIRCLE: text = shapeFilled ? "ドラッグで塗り楕円 (c, Shift:正円)" : "ドラッグで枠線楕円 (c, Shift:正円)"; break;
+          case TOOLS.FILL: text = "クリックで塗りつぶし (g)"; break;
+          case TOOLS.LINE: text = shiftDown ? "直線 (22.5°スナップ中) (l)" : "ドラッグで直線 (l, Shift:22.5°スナップ)"; break;
+          case TOOLS.SPoit: text = "クリックでピクセルの色を取得、前のツールに戻る (Alt:一時切替え)"; break;
         }
       }
       hint.textContent = text;
@@ -1048,7 +1059,12 @@
     const pad = 0.6 / scale;
 
     if (canDrawGrid) {
-      ctx.strokeStyle = "rgba(0,0,0,0.08)";
+      // ズームアウト時は線が密集するため不透明度を上げても見やすく調整
+      const pixelCssSize = PIXEL_SIZE * scale;
+      const denseBoost = Math.max(0, 18 - pixelCssSize) * 0.012;
+      const gridAlpha = Math.min(0.13, 0.08 + denseBoost);
+      const axisAlpha = Math.min(0.30, gridAlpha * 1.8);
+      ctx.strokeStyle = `rgba(0,0,0,${gridAlpha.toFixed(3)})`;
       ctx.lineWidth = 1 / scale;
       ctx.beginPath();
       for (let gx = minGridX; gx <= maxGridX; gx++) {
@@ -1062,7 +1078,7 @@
         ctx.lineTo(maxWorldX, wy);
       }
       ctx.stroke();
-      ctx.strokeStyle = "rgba(0,0,0,0.18)";
+      ctx.strokeStyle = `rgba(0,0,0,${axisAlpha.toFixed(3)})`;
       ctx.lineWidth = 1.5 / scale;
       ctx.beginPath();
       ctx.moveTo(0, minWorldY); ctx.lineTo(0, maxWorldY);
@@ -1316,9 +1332,35 @@
       return;
     }
     if(e.key==="Shift") { shiftDown=true; if(isDrawing && (currentTool===TOOLS.CIRCLE || currentTool===TOOLS.LINE)) { scheduleRender(); updateToolUI(); } }
+    if(e.key.toLowerCase()==="p" && !e.ctrlKey && !e.metaKey && !e.altKey){
+      e.preventDefault();
+      selectTool(TOOLS.DOT);
+    }
+    if(e.key.toLowerCase()==="b" && !e.ctrlKey && !e.metaKey && !e.altKey){
+      e.preventDefault();
+      selectTool(TOOLS.PEN);
+    }
     if(e.key.toLowerCase()==="s" && !e.ctrlKey && !e.metaKey && !e.altKey){
       e.preventDefault();
-      selectTool(TOOLS.SPoit);
+      selectTool(TOOLS.RECT);
+    }
+    if(e.key.toLowerCase()==="c" && !e.ctrlKey && !e.metaKey && !e.altKey){
+      e.preventDefault();
+      selectTool(TOOLS.CIRCLE);
+    }
+    if(e.key.toLowerCase()==="g" && !e.ctrlKey && !e.metaKey && !e.altKey){
+      e.preventDefault();
+      selectTool(TOOLS.FILL);
+    }
+    if(e.key.toLowerCase()==="l" && !e.ctrlKey && !e.metaKey && !e.altKey){
+      e.preventDefault();
+      selectTool(TOOLS.LINE);
+    }
+    if(e.key === "Alt" || e.key === "Option"){
+      if(!e.repeat && currentTool !== TOOLS.SPoit){
+        spoitPrevTool = currentTool;
+        selectTool(TOOLS.SPoit);
+      }
     }
     if (e.key === "+" || e.key === "=") {
       scale = Math.min(MAX_SCALE, scale * 1.2);
@@ -1328,9 +1370,14 @@
       scheduleRender(); updateInfo(); updateToolUI();
     }
   });
-  window.addEventListener("keyup", (e)=>{
-    if(e.key==="Shift") { shiftDown=false; if(isDrawing && (currentTool===TOOLS.CIRCLE || currentTool===TOOLS.LINE)) { scheduleRender(); updateToolUI(); } }
-  });
+   window.addEventListener("keyup", (e)=>{
+     if(e.key==="Shift") { shiftDown=false; if(isDrawing && (currentTool===TOOLS.CIRCLE || currentTool===TOOLS.LINE)) { scheduleRender(); updateToolUI(); } }
+     if((e.key === "Alt" || e.key === "Option") && currentTool === TOOLS.SPoit && spoitPrevTool){
+       const prev = spoitPrevTool;
+       spoitPrevTool = null;
+       selectTool(prev);
+     }
+   });
 
   // Mouse
   canvas.addEventListener("mousedown", (e) => {
@@ -1350,15 +1397,17 @@
      isEraserStroke = e.button===2;
      activeButton = e.button;
 
-     if(currentTool === TOOLS.SPoit){
-       const col = getPixel(grid.x,grid.y) || ERASER_COLOR;
-       selectColor(col);
-       const prev = spoitPrevTool || TOOLS.DOT;
-       isEraserStroke = false;
-       activeButton = null;
-       selectTool(prev);
-       return;
-     }
+      if(currentTool === TOOLS.SPoit){
+        const col = getPixel(grid.x,grid.y) || ERASER_COLOR;
+        selectColor(col);
+        if(!e.altKey){
+          const prev = spoitPrevTool || TOOLS.DOT;
+          isEraserStroke = false;
+          activeButton = null;
+          selectTool(prev);
+        }
+        return;
+      }
      if(currentTool===TOOLS.DOT){
       isDotPanning = true;
       dotHasMoved = false;
