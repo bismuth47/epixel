@@ -8,7 +8,7 @@ const { createClient } = require("@supabase/supabase-js");
 
 const PORT = process.env.PORT || 3000;
 const DATA_FILE = path.join(__dirname, "canvas.json");
-const SAVE_INTERVAL_MS = 10000;
+const SAVE_INTERVAL_MS = 2000;
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
@@ -216,12 +216,14 @@ async function loadCanvas() {
   }
 }
 
-function saveCanvas() {
+async function saveCanvas() {
   if (supabase) {
     if (pendingUpserts.size === 0 && pendingDeletes.size === 0) return;
-    saveToSupabase().catch(e => {
+    try {
+      await saveToSupabase();
+    } catch (e) {
       console.error("[save] failed:", e.message);
-    });
+    }
   } else {
     if (!dirty) return;
     try {
@@ -238,19 +240,27 @@ function saveCanvas() {
 // Initial load (async if Supabase) — don't block listen but set ready flag
 loadCanvas();
 // periodic save
-setInterval(saveCanvas, SAVE_INTERVAL_MS);
-// graceful shutdown
-process.on("SIGINT", async () => {
-  console.log("\n[SIGINT] saving...");
-  if (supabase) await saveToSupabase();
-  else saveCanvas();
+const saveInterval = setInterval(saveCanvas, SAVE_INTERVAL_MS);
+
+// Graceful shutdown: wait for in-progress save, then flush remaining pending changes
+async function gracefulShutdown(signal) {
+  console.log(`\n[${signal}] saving...`);
+  clearInterval(saveInterval);
+  // Wait for any in-progress Supabase save to finish (Render.com gives ~30s for SIGTERM)
+  const startTime = Date.now();
+  while (isSaving && Date.now() - startTime < 25000) {
+    await new Promise(r => setTimeout(r, 200));
+  }
+  if (isSaving) {
+    console.error(`[${signal}] save timed out, may exit with unsaved changes`);
+  }
+  // Flush any pending changes accumulated since last interval save
+  await saveCanvas();
+  console.log(`[${signal}] save complete, exiting`);
   process.exit(0);
-});
-process.on("SIGTERM", async () => {
-  if (supabase) await saveToSupabase();
-  else saveCanvas();
-  process.exit(0);
-});
+}
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 
 // ---- Health ----
 app.get("/health", (req, res) => res.json({ ok: true, ready, pixels: canvasData.size, storage: supabase ? "supabase" : "file", error: loadError || undefined }));
@@ -279,46 +289,21 @@ app.get("/api/pixels", async (req, res) => {
   if (spanX * spanY > 250000) {
     return res.status(400).json({ error: "viewport area too large (max 250k cells, zoom in)" });
   }
-  // Cache 10s on client, allow CDN 30s
-  res.set("Cache-Control", "public, max-age=10, s-maxage=30");
-
-  if (supabase) {
-    try {
-      const { data, error } = await supabase
-        .from(SUPABASE_TABLE)
-        .select("x,y,color")
-        .gte("x", minX).lte("x", maxX)
-        .gte("y", minY).lte("y", maxY)
-        .limit(MAX_VIEWPORT_PIXELS);
-      if (error) {
-        console.error("[api/pixels] supabase error:", error.message);
-        return res.status(500).json({ error: error.message });
-      }
-      // Filter by ALLOWED_COLORS (defense)
-      const filtered = [];
-      for (const r of data) {
-        const c = (r.color||"").toLowerCase();
-        if (c === ERASER_COLOR) continue;
-        if (ALLOWED_COLORS.has(c)) filtered.push({ x: r.x, y: r.y, color: c });
-      }
-      return res.json({ pixels: filtered, truncated: data.length >= MAX_VIEWPORT_PIXELS });
-    } catch (e) {
-      console.error("[api/pixels] error:", e.message);
-      return res.status(500).json({ error: e.message });
+  // Always read from in-memory canvasData — this is the source of truth.
+  // Supabase is only used for startup load + periodic persistence saves.
+  // Reading from the DB here would return stale data (up to SAVE_INTERVAL_MS behind).
+  res.set("Cache-Control", "no-cache");
+  const out = [];
+  for (const [k, color] of canvasData) {
+    const comma = k.indexOf(",");
+    const x = parseInt(k.slice(0, comma), 10);
+    const y = parseInt(k.slice(comma+1), 10);
+    if (x >= minX && x <= maxX && y >= minY && y <= maxY) {
+      out.push({ x, y, color });
+      if (out.length >= MAX_VIEWPORT_PIXELS) break;
     }
-  } else {
-    const out = [];
-    for (const [k, color] of canvasData) {
-      const comma = k.indexOf(",");
-      const x = parseInt(k.slice(0, comma), 10);
-      const y = parseInt(k.slice(comma+1), 10);
-      if (x >= minX && x <= maxX && y >= minY && y <= maxY) {
-        out.push({ x, y, color });
-        if (out.length >= MAX_VIEWPORT_PIXELS) break;
-      }
-    }
-    return res.json({ pixels: out, truncated: out.length >= MAX_VIEWPORT_PIXELS });
   }
+  return res.json({ pixels: out, truncated: out.length >= MAX_VIEWPORT_PIXELS });
 });
 
 // Lightweight meta endpoint for initial viewport decision
