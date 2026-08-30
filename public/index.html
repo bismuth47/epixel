@@ -1217,8 +1217,8 @@
   }
 
   function updateInfo() {
-    if (hoverGrid) coordEl.textContent = `${hoverGrid.x}, ${hoverGrid.y}`;
-    else coordEl.textContent = `${Math.floor(offsetX/PIXEL_SIZE)}, ${Math.floor(offsetY/PIXEL_SIZE)}`;
+    if (hoverGrid) coordEl.textContent = `${hoverGrid.x}, ${-hoverGrid.y}`;
+    else coordEl.textContent = `${Math.floor(offsetX/PIXEL_SIZE)}, ${-Math.floor(offsetY/PIXEL_SIZE)}`;
     zoomEl.textContent = Math.round(scale * 100) + "%";
     pixCountEl.textContent = worldPixelCount;
   }
@@ -1456,7 +1456,7 @@
     const world = screenToWorld(e.clientX, e.clientY);
     const grid = worldToGrid(world.x, world.y);
     hoverGrid = grid;
-    coordEl.textContent = `${grid.x}, ${grid.y}`;
+    coordEl.textContent = `${grid.x}, ${-grid.y}`;
 
     if(isDotPanning){
       const dx = e.clientX - dotPanStartScreen.x;
@@ -1723,7 +1723,7 @@
       const world=screenToWorld(t.clientX,t.clientY);
       const grid=worldToGrid(world.x,world.y);
       hoverGrid=grid;
-      coordEl.textContent=`${grid.x}, ${grid.y}`;
+      coordEl.textContent=`${grid.x}, ${-grid.y}`;
       if(isDrawing){
         if(currentTool===TOOLS.PEN && penLastGrid){
           if(grid.x!==penLastGrid.x || grid.y!==penLastGrid.y){
