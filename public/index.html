@@ -1078,7 +1078,7 @@
       // ズームアウト時は線が密集するため不透明度を上げても見やすく調整
       const pixelCssSize = PIXEL_SIZE * scale;
       const denseBoost = Math.max(0, 18 - pixelCssSize) * 0.012;
-      const gridAlpha = Math.min(0.10, 0.05 + denseBoost);
+      const gridAlpha = Math.min(0.06, 0.03 + denseBoost);
       const axisAlpha = Math.min(0.30, gridAlpha * 1.8);
       ctx.strokeStyle = `rgba(0,0,0,${gridAlpha.toFixed(3)})`;
       ctx.lineWidth = 1 / scale;
