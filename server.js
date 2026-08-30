@@ -12,7 +12,8 @@ const SAVE_INTERVAL_MS = 2000;
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
-const SUPABASE_TABLE = "canvas_pixels";
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SUPABASE_TABLE = process.env.SUPABASE_TABLE || "canvas_pixels";
 
 // ── Color code mapping (0–26 = 27 drawable colors, white/eraser is special) ──
 const CODE_TO_COLOR = [
@@ -65,11 +66,12 @@ const io = new Server(server, {
   maxHttpBufferSize: 1e6,
 });
 
-// Supabase client (lazy init)
+// Supabase client (prefer service_role key; fall back to anon)
 let supabase = null;
-if (SUPABASE_URL && SUPABASE_ANON_KEY) {
-  supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-  console.log("[supabase] client initialized");
+const SUPABASE_KEY = SUPABASE_SERVICE_ROLE_KEY || SUPABASE_ANON_KEY;
+if (SUPABASE_URL && SUPABASE_KEY) {
+  supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+  console.log(`[supabase] client initialized (${SUPABASE_SERVICE_ROLE_KEY ? 'service_role' : 'anon'})`);
 } else {
   console.log("[supabase] not configured, using file-based storage");
 }
@@ -79,6 +81,7 @@ const canvasData = new Map();
 let dirty = false;
 let ready = false;
 let loadError = null;
+let dbAcceptsCodes = true; // optimistic: assume INTEGER column; falls back to hex storage if CHECK rejects codes
 // Incremental save state for Supabase (avoid full 66k delete+upsert that blocks event loop)
 let isSaving = false;
 const pendingUpserts = new Map(); // "x,y" -> color
@@ -139,7 +142,11 @@ async function saveToSupabase() {
     if (upserts.size > 0) {
       const payload = Array.from(upserts, ([k, color]) => {
         const [x, y] = k.split(",").map(Number);
-        return { x, y, color };
+        if (dbAcceptsCodes) {
+          return { x, y, color }; // numeric code (0–26)
+        }
+        const hex = CODE_TO_COLOR[color];
+        return { x, y, color: hex !== undefined ? hex : CODE_TO_COLOR[0] };
       });
       for (let i = 0; i < payload.length; i += 1000) {
         const batch = payload.slice(i, i + 1000);
@@ -147,6 +154,25 @@ async function saveToSupabase() {
           .from(SUPABASE_TABLE)
           .upsert(batch, { onConflict: ["x", "y"] });
         if (error) {
+          // If DB still has TEXT column with hex CHECK, fall back to storing hex strings
+          if (dbAcceptsCodes && error.message.includes("check constraint") && error.message.includes("color")) {
+            console.log("[save] DB column does not accept numeric codes — switching to hex storage");
+            dbAcceptsCodes = false;
+            const hexBatch = batch.map(p => {
+              const hex = CODE_TO_COLOR[p.color];
+              return { x: p.x, y: p.y, color: hex !== undefined ? hex : CODE_TO_COLOR[0] };
+            });
+            const { error: retryError } = await supabase
+              .from(SUPABASE_TABLE)
+              .upsert(hexBatch, { onConflict: ["x", "y"] });
+            if (retryError) {
+              console.error("[save] hex fallback also failed:", retryError.message);
+              for (const p of batch) pendingUpserts.set(`${p.x},${p.y}`, p.color);
+              isSaving = false;
+              return false;
+            }
+            continue;
+          }
           console.error("[save] Supabase upsert error:", error.message);
           // re-queue failed batch
           for (const p of batch) pendingUpserts.set(`${p.x},${p.y}`, p.color);
