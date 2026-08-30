@@ -14,14 +14,41 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 const SUPABASE_TABLE = "canvas_pixels";
 
-const ALLOWED_COLORS = new Set([
+// ── Color code mapping (0–26 = 27 drawable colors, white/eraser is special) ──
+const CODE_TO_COLOR = [
   "#175145","#2e8065","#51b341","#9bd547","#fff971","#ff7f4f",
   "#ff4f4f","#ee3046","#df426e","#ff88dd","#a62654","#621b52",
   "#371848","#0c082a","#261152","#272573","#4876bb","#7fd3e6",
-  "#c7f7f2","#ffffff","#bbbbbb","#666666","#fdcbb0","#d29c8a",
+  "#c7f7f2","#bbbbbb","#666666","#fdcbb0","#d29c8a",
   "#9e4d4d","#712835","#5d1835","#35082a"
-]);
+];
+const COLOR_TO_CODE = new Map(CODE_TO_COLOR.map((c, i) => [c.toLowerCase(), i]));
+const VALID_CODES = new Set(CODE_TO_COLOR.map((_, i) => i));
+const ERASER_CODE = 255; // special sentinel, never stored in DB
 const ERASER_COLOR = "#ffffff";
+
+// Convert hex string or numeric code to a numeric code (0–26) or ERASER_CODE.
+// Returns undefined for invalid colors.
+function normalizeColor(color) {
+  if (typeof color === "number" && Number.isInteger(color)) {
+    if (color === ERASER_CODE) return ERASER_CODE;
+    if (color >= 0 && color <= 26) return color;
+    return undefined;
+  }
+  if (typeof color !== "string") return undefined;
+  let normalized = color.toLowerCase();
+  if (normalized === "#7fd3e0") normalized = "#7fd3e6"; // legacy palette rename
+  if (normalized === ERASER_COLOR) return ERASER_CODE;
+  return COLOR_TO_CODE.get(normalized);
+}
+
+// Convert a hex string to a numeric code (used during data migration / legacy load)
+function hexToCode(hex) {
+  let normalized = hex.toLowerCase();
+  if (normalized === "#7fd3e0") normalized = "#7fd3e6";
+  if (normalized === ERASER_COLOR) return ERASER_CODE;
+  return COLOR_TO_CODE.get(normalized);
+}
 
 const app = express();
 app.use(compression({ threshold: 1024 }));
@@ -64,21 +91,10 @@ async function loadFromSupabase() {
   let removed = 0;
   for (const row of data) {
     const { x, y, color } = row;
-    if (typeof color !== "string" || !/^#[0-9A-Fa-f]{6}$/.test(color)) {
-      removed++;
-      continue;
-    }
-    let normalized = color.toLowerCase();
-    if (normalized === "#7fd3e0") normalized = "#7fd3e6";
-    if (normalized === ERASER_COLOR) {
-      removed++;
-      continue;
-    }
-    if (ALLOWED_COLORS.has(normalized)) {
-      canvasData.set(`${x},${y}`, normalized);
-    } else {
-      removed++;
-    }
+    const code = normalizeColor(color);
+    if (code === undefined) { removed++; continue; }
+    if (code === ERASER_CODE) { removed++; continue; } // eraser never stored
+    canvasData.set(`${x},${y}`, code);
   }
   console.log(`[load] ${canvasData.size} pixels loaded from Supabase${removed ? `, ${removed} removed` : ""}`);
 }
@@ -164,11 +180,9 @@ async function loadFromSupabaseBatch() {
     if (!data || data.length === 0) break;
     for (const row of data) {
       const { x, y, color } = row;
-      if (typeof color !== "string" || !/^#[0-9A-Fa-f]{6}$/.test(color)) continue;
-      let normalized = color.toLowerCase();
-      if (normalized === "#7fd3e0") normalized = "#7fd3e6";
-      if (normalized === ERASER_COLOR) continue;
-      if (ALLOWED_COLORS.has(normalized)) canvasData.set(`${x},${y}`, normalized);
+      const code = normalizeColor(color);
+      if (code === undefined || code === ERASER_CODE) continue;
+      canvasData.set(`${x},${y}`, code);
     }
     from += batchSize;
     if (data.length < batchSize) break;
@@ -194,15 +208,14 @@ async function loadCanvas() {
         const raw = fs.readFileSync(DATA_FILE, "utf-8");
         const obj = JSON.parse(raw);
         let removed = 0;
-        for (const [k, v] of Object.entries(obj)) {
-          if (typeof v === "string" && /^#[0-9A-Fa-f]{6}$/.test(v)) {
-            let normalized = v.toLowerCase();
-            if (normalized === "#7fd3e0") normalized = "#7fd3e6";
-            if (normalized === ERASER_COLOR) { removed++; continue; }
-            if (ALLOWED_COLORS.has(normalized)) canvasData.set(k, normalized);
-            else removed++;
-          }
-        }
+         for (const [k, v] of Object.entries(obj)) {
+           const code = typeof v === "number" ? v : hexToCode(v);
+           if (code === undefined || code === ERASER_CODE || !VALID_CODES.has(code)) {
+             removed++;
+             continue;
+           }
+           canvasData.set(k, code);
+         }
         console.log(`[load] ${canvasData.size} pixels loaded from ${DATA_FILE}${removed ? `, ${removed} removed (old palette)` : ""}`);
         if (removed > 0) { dirty = true; saveCanvas(); }
       } else {
@@ -328,10 +341,14 @@ function isValidDraw(payload) {
   if (!payload || typeof payload !== "object") return false;
   const { x, y, color } = payload;
   if (!Number.isInteger(x) || !Number.isInteger(y)) return false;
-  if (typeof color !== "string" || !/^#[0-9A-Fa-f]{6}$/.test(color)) return false;
-  if (!ALLOWED_COLORS.has(color.toLowerCase())) return false;
   if (Math.abs(x) > 1_000_000 || Math.abs(y) > 1_000_000) return false;
-  return true;
+  if (typeof color === "number") {
+    if (color === ERASER_CODE || VALID_CODES.has(color)) return true;
+    return false;
+  }
+  // Legacy hex-string support (backward compat)
+  if (typeof color === "string" && /^#[0-9A-Fa-f]{6}$/.test(color)) return true;
+  return false;
 }
 
 function isValidDrawBatch(payload) {
@@ -394,8 +411,7 @@ io.on("connection", (socket) => {
   // New protocol: viewport-based. Keep legacy init only for ?legacy=1 clients
   const isLegacy = socket.handshake.query.legacy === "1" || socket.handshake.query.legacy === "true";
   if (isLegacy) {
-    // Warning: large payload for 320k rows — legacy only
-    socket.emit("init", Object.fromEntries(canvasData));
+    socket.emit("init", Object.fromEntries(canvasData)); // codes (numbers) now
   } else {
     socket.emit("ready", { pixels: canvasData.size, ready });
     // also send userCount
@@ -406,22 +422,21 @@ io.on("connection", (socket) => {
     if (!isValidDraw(data)) return;
     if (!checkRateLimit(socket)) return;
     const { x, y, color } = data;
-    const normalized = color.toLowerCase();
+    const code = normalizeColor(color);
+    if (code === undefined) return;
     const key = `${x},${y}`;
-    if (normalized === ERASER_COLOR) {
-      const had = canvasData.has(key);
-      if (had) canvasData.delete(key);
-      // track delete for Supabase, remove from pending upserts
+    if (code === ERASER_CODE) {
+      if (canvasData.has(key)) canvasData.delete(key);
       pendingUpserts.delete(key);
       pendingDeletes.add(key);
       if (!supabase) dirty = true;
     } else {
-      canvasData.set(key, normalized);
+      canvasData.set(key, code);
       pendingDeletes.delete(key);
-      pendingUpserts.set(key, normalized);
+      pendingUpserts.set(key, code);
       if (!supabase) dirty = true;
     }
-    io.emit("draw", { x, y, color: normalized, totalPixels: canvasData.size });
+    io.emit("draw", { x, y, color: code, totalPixels: canvasData.size });
   });
 
   socket.on("drawBatch", (data) => {
@@ -429,18 +444,19 @@ io.on("connection", (socket) => {
     if (!checkBatchRateLimit(socket, data.length)) return;
     const normalizedBatch = [];
     for (const { x, y, color } of data) {
-      const normalized = color.toLowerCase();
+      const code = normalizeColor(color);
+      if (code === undefined) continue;
       const key = `${x},${y}`;
-      if (normalized === ERASER_COLOR) {
+      if (code === ERASER_CODE) {
         if (canvasData.has(key)) canvasData.delete(key);
         pendingUpserts.delete(key);
         pendingDeletes.add(key);
       } else {
-        canvasData.set(key, normalized);
+        canvasData.set(key, code);
         pendingDeletes.delete(key);
-        pendingUpserts.set(key, normalized);
+        pendingUpserts.set(key, code);
       }
-      normalizedBatch.push({ x, y, color: normalized });
+      normalizedBatch.push({ x, y, color: code });
     }
     if (!supabase) dirty = true;
     io.emit("drawBatch", { pixels: normalizedBatch, totalPixels: canvasData.size });

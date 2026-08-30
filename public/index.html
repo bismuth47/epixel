@@ -160,7 +160,37 @@
     "#c7f7f2","#ffffff","#bbbbbb","#666666","#fdcbb0","#d29c8a",
     "#9e4d4d","#712835","#5d1835","#35082a"
   ];
+
+  // ── Color code mapping (0–26 = 27 drawable colors; white/eraser excluded) ──
+  // CODE_TO_COLOR has 27 entries. COLORS (above, 28) includes the eraser for
+  // palette display only. The eraser is never stored as a code.
+  const CODE_TO_COLOR = [
+    "#175145","#2e8065","#51b341","#9bd547","#fff971","#ff7f4f",
+    "#ff4f4f","#ee3046","#df426e","#ff88dd","#a62654","#621b52",
+    "#371848","#0c082a","#261152","#272573","#4876bb","#7fd3e6",
+    "#c7f7f2","#bbbbbb","#666666","#fdcbb0","#d29c8a",
+    "#9e4d4d","#712835","#5d1835","#35082a"
+  ];
+  const COLOR_TO_CODE = new Map(CODE_TO_COLOR.map((c, i) => [c.toLowerCase(), i]));
+  const ERASER_CODE = 255; // special sentinel, not a stored color
   const ERASER_COLOR = "#ffffff";
+
+  // Convert a hex color to its wire-format numeric code (or ERASER_CODE).
+  function toWireColor(hexColor) {
+    const norm = hexColor.toLowerCase();
+    if (norm === ERASER_COLOR) return ERASER_CODE;
+    return COLOR_TO_CODE.get(norm);
+  }
+
+  // Convert a wire-format numeric code (or legacy hex string) back to a hex color.
+  function fromWireColor(code) {
+    if (typeof code === "number") {
+      if (code === ERASER_CODE) return ERASER_COLOR;
+      return CODE_TO_COLOR[code];
+    }
+    // Legacy: hex string from old server
+    return typeof code === "string" ? code.toLowerCase() : ERASER_COLOR;
+  }
   const TOOLS = { DOT: 'dot', PEN: 'pen', RECT: 'rect', CIRCLE: 'circle', FILL: 'fill', LINE: 'line', SPoit: 'spoit' };
   const TOOL_LABELS = {
     [TOOLS.DOT]: 'ドット',
@@ -336,9 +366,9 @@
      }
      if(socket && socket.connected){
        const batch=[];
-       for(const p of penStrokeMap.values()){
-         batch.push(p.prev===null ? {x:p.x,y:p.y,color:"#ffffff"} : {x:p.x,y:p.y,color:p.prev});
-       }
+        for(const p of penStrokeMap.values()){
+          batch.push(p.prev===null ? {x:p.x,y:p.y,color:ERASER_CODE} : {x:p.x,y:p.y,color:toWireColor(p.prev)});
+        }
        socket.emit("drawBatch", batch);
      }
      scheduleRender(); updateInfo();
@@ -359,7 +389,7 @@
   function undo(){
     if(undoStack.length===0) return;
     const entry = undoStack.pop();
-    const revert = entry.pixels.map(p=>({x:p.x, y:p.y, color: p.prev || ERASER_COLOR}));
+    const revert = entry.pixels.map(p=>({x:p.x, y:p.y, color: p.prev === null ? ERASER_CODE : toWireColor(p.prev)}));
     for(const p of entry.pixels){
       if(p.prev === null) deletePixel(p.x,p.y);
       else setPixel(p.x,p.y, p.prev);
@@ -375,7 +405,7 @@
   function redo(){
     if(redoStack.length===0) return;
     const entry = redoStack.pop();
-    const reapply = entry.pixels.map(p=>({x:p.x, y:p.y, color: p.newColor}));
+    const reapply = entry.pixels.map(p=>({x:p.x, y:p.y, color: toWireColor(p.newColor)}));
     for(const p of entry.pixels){
       if(p.newColor === ERASER_COLOR || p.newColor === null) deletePixel(p.x,p.y);
       else setPixel(p.x,p.y, p.newColor);
@@ -684,8 +714,8 @@
       for(let i=0;i<arr.length;i+=CHUNK){
         const slice = arr.slice(i, i+CHUNK);
         for(const {x,y,color} of slice){
-          if(typeof color!=="string") continue;
-          setPixel(x,y, color);
+          const hex = fromWireColor(color);
+          if(hex) setPixel(x,y, hex);
         }
         if(arr.length > CHUNK && i+CHUNK < arr.length){
           // yield to render between chunks
@@ -1256,11 +1286,11 @@
       setPixel(gx,gy, normalized);
     }
     scheduleRender(); updateInfo();
-    if (socket && socket.connected) {
-      socket.emit("draw", { x: gx, y: gy, color: normalized });
-    }
-  }
-  function doDrawBatch(pixelList){
+     if (socket && socket.connected) {
+       socket.emit("draw", { x: gx, y: gy, color: toWireColor(normalized) });
+     }
+   }
+   function doDrawBatch(pixelList){
     if(!pixelList || pixelList.length===0) return;
     if(!canDraw()){ showDrawLimitWarn(); return; }
     const normalized = getCurrentColor().toLowerCase();
@@ -1276,13 +1306,13 @@
     scheduleRender(); updateInfo();
     if(socket && socket.connected){
       if(pixelList.length===1){
-        socket.emit("draw", {x:pixelList[0].x, y:pixelList[0].y, color: normalized});
-      } else {
-        socket.emit("drawBatch", pixelList.map(p=>({x:p.x,y:p.y,color:normalized})));
-      }
-    }
-  }
-  function applyDrawBatchNoUndo(pixelList){
+        socket.emit("draw", {x:pixelList[0].x, y:pixelList[0].y, color: toWireColor(normalized)});
+       } else {
+         socket.emit("drawBatch", pixelList.map(p=>({x:p.x,y:p.y,color: toWireColor(normalized)})));
+       }
+     }
+   }
+   function applyDrawBatchNoUndo(pixelList){
     if(!pixelList || pixelList.length===0) return;
     const normalized = selectedColor.toLowerCase();
     const isEraser = normalized === ERASER_COLOR;
@@ -1291,8 +1321,8 @@
       else setPixel(p.x,p.y, normalized);
     }
     scheduleRender(); updateInfo();
-    if(socket && socket.connected){
-      socket.emit("drawBatch", pixelList.map(p=>({x:p.x,y:p.y,color:normalized})));
+  if(socket && socket.connected){
+      socket.emit("drawBatch", pixelList.map(p=>({x:p.x,y:p.y,color: toWireColor(normalized)})));
     }
   }
   function doErase(gx, gy) {
@@ -1302,7 +1332,7 @@
     deletePixel(gx,gy);
     scheduleRender(); updateInfo();
     if (socket && socket.connected) {
-      socket.emit("draw", { x: gx, y: gy, color: ERASER_COLOR });
+      socket.emit("draw", { x: gx, y: gy, color: ERASER_CODE });
     }
   }
   function doFill(gx, gy){
@@ -1445,7 +1475,7 @@
       if(normalized === ERASER_COLOR) deletePixel(grid.x,grid.y);
       else setPixel(grid.x,grid.y, normalized);
       scheduleRender(); updateInfo();
-      if(socket && socket.connected) socket.emit("draw", {x:grid.x, y:grid.y, color: normalized});
+      if(socket && socket.connected) socket.emit("draw", {x:grid.x, y:grid.y, color: toWireColor(normalized)});
       canvas.setPointerCapture && canvas.setPointerCapture(e.pointerId);
     } else if(currentTool===TOOLS.RECT || currentTool===TOOLS.CIRCLE || currentTool===TOOLS.LINE){
       isDrawing = true;
@@ -1513,7 +1543,7 @@
           }
           scheduleRender(); updateInfo();
           if(socket && socket.connected){
-            socket.emit("drawBatch", toDraw.map(p=>({x:p.x,y:p.y,color:normalized})));
+            socket.emit("drawBatch", toDraw.map(p=>({x:p.x,y:p.y,color: toWireColor(normalized)})));
           }
           penLastGrid = grid;
         }
@@ -1674,7 +1704,7 @@
         if(prevNorm !== normalized) penStrokeMap.set(k, {x:grid.x, y:grid.y, prev: prev, newColor: normalized});
         if(normalized === ERASER_COLOR) deletePixel(p.x,p.y); else setPixel(p.x,p.y, normalized);
         scheduleRender(); updateInfo();
-        if(socket && socket.connected) socket.emit("draw", {x:grid.x, y:grid.y, color: normalized});
+        if(socket && socket.connected) socket.emit("draw", {x:grid.x, y:grid.y, color: toWireColor(normalized)});
       } else if(currentTool===TOOLS.RECT || currentTool===TOOLS.CIRCLE || currentTool===TOOLS.LINE){
         isDrawing=true;
         drawStartGrid=grid;
@@ -1748,7 +1778,7 @@
               if(isEraser) deletePixel(p.x,p.y); else setPixel(p.x,p.y, normalized);
             }
             scheduleRender(); updateInfo();
-            if(socket && socket.connected) socket.emit("drawBatch", toDraw.map(p=>({x:p.x,y:p.y,color:normalized})));
+            if(socket && socket.connected) socket.emit("drawBatch", toDraw.map(p=>({x:p.x,y:p.y,color: toWireColor(normalized)})));
             penLastGrid=grid;
           }
         } else if((currentTool===TOOLS.RECT || currentTool===TOOLS.CIRCLE || currentTool===TOOLS.LINE) && drawStartGrid){
@@ -1908,28 +1938,28 @@
     }
     if(!initialLoaded) fetchViewport(true);
   });
-  socket.on("init", (data) => {
-    // legacy full init (320k would be heavy) — keep for ?legacy=1
-    if(data && typeof data === "object" && Object.keys(data).length>0){
-      for (const [k, v] of Object.entries(data)) { const [px,py]=k.split(',').map(Number); setPixel(px,py, v); }
-      undoStack=[]; redoStack=[]; updateUndoUI();
-      worldPixelCount = pixelCount;
-      initialLoaded = true;
-      hideLoading();
-      scheduleRender(); updateInfo();
-    }
-  });
+   socket.on("init", (data) => {
+     // legacy full init (320k would be heavy) — keep for ?legacy=1
+     if(data && typeof data === "object" && Object.keys(data).length>0){
+       for (const [k, v] of Object.entries(data)) { const [px,py]=k.split(',').map(Number); setPixel(px,py, fromWireColor(v)); }
+       undoStack=[]; redoStack=[]; updateUndoUI();
+       worldPixelCount = pixelCount;
+       initialLoaded = true;
+       hideLoading();
+       scheduleRender(); updateInfo();
+     }
+   });
   socket.on("draw", (info) => {
-    const { x, y, color, totalPixels } = info;
-    const normalized = color.toLowerCase();
-    if (normalized === ERASER_COLOR) {
-      deletePixel(x,y);
-    } else {
-      setPixel(x,y, normalized);
-    }
-    if(typeof totalPixels === "number") worldPixelCount = totalPixels;
-    scheduleRender(); updateInfo();
-  });
+     const { x, y, color, totalPixels } = info;
+     const hex = fromWireColor(color);
+     if (hex === ERASER_COLOR) {
+       deletePixel(x,y);
+     } else {
+       setPixel(x,y, hex);
+     }
+     if(typeof totalPixels === "number") worldPixelCount = totalPixels;
+     scheduleRender(); updateInfo();
+   });
   socket.on("drawBatch", (data) => {
     let arr;
     if(Array.isArray(data)){
@@ -1941,11 +1971,11 @@
       return;
     }
     for(const {x,y,color} of arr){
-      const normalized = (color||'').toLowerCase();
-      if(!Number.isInteger(x) || !Number.isInteger(y)) continue;
-      if(normalized === ERASER_COLOR) deletePixel(x,y);
-      else setPixel(x,y, normalized);
-    }
+       const hex = fromWireColor(color);
+       if(!Number.isInteger(x) || !Number.isInteger(y)) continue;
+       if(hex === ERASER_COLOR) deletePixel(x,y);
+       else setPixel(x,y, hex);
+     }
     scheduleRender(); updateInfo();
   });
   socket.on("userCount", (n) => {

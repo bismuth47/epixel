@@ -18,7 +18,25 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 const TABLE = "canvas_pixels";
 
+// ── Color code mapping (0–26, excludes eraser white) ──
+const CODE_TO_COLOR = [
+  "#175145","#2e8065","#51b341","#9bd547","#fff971","#ff7f4f",
+  "#ff4f4f","#ee3046","#df426e","#ff88dd","#a62654","#621b52",
+  "#371848","#0c082a","#261152","#272573","#4876bb","#7fd3e6",
+  "#c7f7f2","#bbbbbb","#666666","#fdcbb0","#d29c8a",
+  "#9e4d4d","#712835","#5d1835","#35082a"
+];
+const COLOR_TO_CODE = new Map(CODE_TO_COLOR.map((c, i) => [c.toLowerCase(), i]));
+const ERASER_CODE = 255;
 const ERASER_COLOR = "#ffffff";
+
+// Convert hex string to numeric code (handles legacy #7fd3e0 → #7fd3e6)
+function hexToCode(hex) {
+  let normalized = hex.toLowerCase();
+  if (normalized === "#7fd3e0") normalized = "#7fd3e6";
+  if (normalized === ERASER_COLOR) return ERASER_CODE;
+  return COLOR_TO_CODE.get(normalized);
+}
 
 if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
   console.error("Error: SUPABASE_URL and SUPABASE_ANON_KEY environment variables are required");
@@ -53,11 +71,11 @@ async function ensureTable() {
 
   // If columns are missing or other issue, the user needs to run SQL manually
   console.error("Could not ensure table exists. Please run this SQL in Supabase SQL Editor:");
-  console.log(`
+   console.log(`
 CREATE TABLE IF NOT EXISTS ${TABLE} (
   x INTEGER NOT NULL,
   y INTEGER NOT NULL,
-  color TEXT NOT NULL CHECK (color ~ '^#[0-9A-Fa-f]{6}$'),
+  color INTEGER NOT NULL CHECK (color >= 0 AND color <= 26),
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW(),
   PRIMARY KEY (x, y)
@@ -88,14 +106,9 @@ async function migrate() {
   const validPixels = [];
   let removed = 0;
 
-  for (const [key, color] of entries) {
-    if (typeof color !== "string" || !/^#[0-9A-Fa-f]{6}$/.test(color)) {
-      removed++;
-      continue;
-    }
-
-    const normalized = color.toLowerCase();
-    if (normalized === ERASER_COLOR) {
+   for (const [key, color] of entries) {
+    const code = typeof color === "string" ? hexToCode(color) : color;
+    if (code === undefined || code === ERASER_CODE || code < 0 || code > 26) {
       removed++;
       continue;
     }
@@ -109,7 +122,7 @@ async function migrate() {
       continue;
     }
 
-    validPixels.push({ x, y, color: normalized });
+    validPixels.push({ x, y, color: code });
   }
 
   console.log(`Valid pixels: ${validPixels.length}, removed: ${removed}`);
