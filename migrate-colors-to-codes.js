@@ -1,32 +1,46 @@
 /**
  * Migration script: Convert existing Supabase color values from hex strings → numeric codes (0–26)
  *
- * This reads every pixel from `canvas_pixels`, converts hex colors to codes,
- * and writes the codes back **in place** (primary key unchanged — no data lost).
+ * SAFE approach: reads all data, converts hex→code, saves a local backup
+ * (canvas-codes-backup.json), then UPSERTS codes in-place. No rows are
+ * deleted — if the CHECK constraint blocks the update, the original hex data
+ * remains intact and the script prints SQL for the user to run.
  *
- * The server now handles BOTH formats (hex strings and numeric codes), so this
- * migration is safe to run while the server is live. After migration, only the
- * DB column type needs updating (one-time SQL, see below).
+ * The server (newly deployed) handles BOTH formats, so it works before and
+ * after this migration.
  *
- * ── Schema fix (run ONCE in Supabase SQL Editor after this script) ──
+ * ── Workflow ──
+ *   1. Run: node migrate-colors-to-codes.js
+ *      - Reads all data, converts hex→code, saves backup, attempts upsert.
+ *      - If CHECK constraint blocks: prints SQL, exits (data is safe).
+ *   2. Run the printed SQL in Supabase SQL Editor (drop CHECK, TRUNCATE,
+ *      change column to INTEGER, add new CHECK).
+ *   3. Re-run: node migrate-colors-to-codes.js --restore
+ *      - Inserts all codes from the backup into the new INTEGER column.
+ *
+ * ── Schema SQL (run in Supabase SQL Editor if script reports CHECK error) ──
  *   ALTER TABLE canvas_pixels
- *     DROP CONSTRAINT IF EXISTS canvas_pixels_color_check,
- *     ALTER COLUMN color TYPE INTEGER USING NULLIF(color, '')::INTEGER,
+ *     DROP CONSTRAINT IF EXISTS canvas_pixels_color_check;
+ *   TRUNCATE canvas_pixels;
+ *   ALTER TABLE canvas_pixels
+ *     ALTER COLUMN color TYPE INTEGER;
+ *   ALTER TABLE canvas_pixels
  *     ALTER COLUMN color SET NOT NULL;
  *   ALTER TABLE canvas_pixels
  *     ADD CONSTRAINT canvas_pixels_color_check CHECK (color >= 0 AND color <= 26);
  *
- * If the column is already INTEGER (new deployment), the script skips automatically.
- *
  * Usage:
- *   SUPABASE_URL=... SUPABASE_ANON_KEY=... node migrate-colors-to-codes.js
+ *   node migrate-colors-to-codes.js
+ *   node migrate-colors-to-codes.js --restore
  */
+const fs = require("fs");
 const path = require("path");
 const { createClient } = require("@supabase/supabase-js");
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 const TABLE = "canvas_pixels";
+const BACKUP_FILE = path.join(__dirname, "canvas-codes-backup.json");
 
 // ── Color code mapping (0–26, excludes eraser white #ffffff) ──
 const CODE_TO_COLOR = [
@@ -65,6 +79,29 @@ if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
 }
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+const isRestoreMode = process.argv.includes("--restore");
+
+// ── SQL for manual schema change (run in Supabase SQL Editor) ──
+// Must TRUNCATE first because hex strings (#175145) can't be cast to INTEGER.
+// Data is safe in canvas-codes-backup.json — restore with --restore after this.
+const SCHEMA_SQL = `
+-- 1. Drop old CHECK constraint (allows any TEXT temporarily)
+ALTER TABLE ${TABLE}
+  DROP CONSTRAINT IF EXISTS ${TABLE}_color_check;
+
+-- 2. Delete old hex data (backed up in canvas-codes-backup.json)
+TRUNCATE ${TABLE};
+
+-- 3. Change column type from TEXT to INTEGER
+ALTER TABLE ${TABLE}
+  ALTER COLUMN color TYPE INTEGER;
+ALTER TABLE ${TABLE}
+  ALTER COLUMN color SET NOT NULL;
+
+-- 4. Add new CHECK constraint for codes 0–26
+ALTER TABLE ${TABLE}
+  ADD CONSTRAINT ${TABLE}_color_check CHECK (color >= 0 AND color <= 26);
+`;
 
 // Detect whether the column is already INTEGER (migration already done)
 async function detectColumnType() {
@@ -77,59 +114,20 @@ async function detectColumnType() {
     process.exit(1);
   }
   if (!sample || sample.length === 0) {
-    console.log("Table is empty — nothing to migrate.");
-    return null; // empty, no type detection needed
+    console.log("Table is empty — nothing to migrate. Use --restore to insert from backup.");
+    return null;
   }
   const sampleColor = sample[0].color;
   return typeof sampleColor === "number" ? "integer" : "text";
 }
 
-async function migrate() {
-  console.log("Detecting column type...");
-  const columnType = await detectColumnType();
-
-  if (columnType === "integer") {
-    console.log("Column is already INTEGER — verifying all values are valid codes...");
-    // Verify and report any bad values
-    let page = 0;
-    const BATCH = 1000;
-    let total = 0, bad = 0;
-    while (true) {
-      const { data, error } = await supabase
-        .from(TABLE)
-        .select("x,y,color")
-        .order("x").order("y")
-        .range(page * BATCH, page * BATCH + BATCH - 1);
-      if (error) { console.error("Read error:", error.message); break; }
-      if (!data || data.length === 0) break;
-      for (const row of data) {
-        const code = normalizeColor(row.color);
-        if (code === undefined || code === ERASER_CODE) {
-          bad++;
-        }
-        total++;
-      }
-      if (data.length < BATCH) break;
-      page++;
-    }
-    console.log(`Verified ${total} pixels, ${bad} invalid. Migration already complete.`);
-    return;
-  }
-
-  if (columnType === null) {
-    console.log("Table is empty. Nothing to migrate. Deploy the new server code; it will create the table via migrate-to-supabase.js if needed.");
-    return;
-  }
-
-  console.log("Column is TEXT (hex strings). Migrating to numeric codes...");
-
-  // Phase 1: Read all pixels
-  console.log("Phase 1: Reading all pixels from Supabase...");
+// ── Phase 1: Read all pixels and convert to codes ──
+async function readAndConvert() {
+  console.log("Reading all pixels from Supabase...");
   const pixelMap = new Map(); // "x,y" -> code
   let page = 0;
   const BATCH = 1000;
-  let totalRead = 0;
-  let hexCount = 0, alreadyCodeCount = 0, removed = 0;
+  let totalRead = 0, hexCount = 0, alreadyCodeCount = 0, removed = 0;
 
   while (true) {
     const { data, error } = await supabase
@@ -146,14 +144,8 @@ async function migrate() {
 
     for (const row of data) {
       const code = normalizeColor(row.color);
-      if (code === undefined) {
-        removed++;
-        continue;
-      }
-      if (code === ERASER_CODE) {
-        removed++; // eraser pixels are not stored
-        continue;
-      }
+      if (code === undefined) { removed++; continue; }
+      if (code === ERASER_CODE) { removed++; continue; } // eraser never stored
       const key = `${row.x},${row.y}`;
       if (typeof row.color === "string" && /^#[0-9A-Fa-f]{6}$/.test(row.color)) hexCount++;
       else alreadyCodeCount++;
@@ -164,63 +156,13 @@ async function migrate() {
     page++;
   }
 
-  console.log(`  Read ${totalRead} pixels (${hexCount} were hex strings, ${alreadyCodeCount} were already codes)`);
-  console.log(`  Removed ${removed} invalid/eraser pixels`);
+  console.log(`  Read ${totalRead} pixels (${hexCount} hex strings, ${alreadyCodeCount} already codes)`);
+  console.log(`  Skipped ${removed} invalid/eraser pixels`);
+  return pixelMap;
+}
 
-  if (pixelMap.size === 0) {
-    console.log("No valid pixels to migrate.");
-    return;
-  }
-
-  // Phase 2: Delete all existing rows (old hex data)
-  console.log("Phase 2: Deleting existing rows...");
-  // Delete in batches using a wide x range (server validates |x| <= 1_000_000)
-  let totalDeleted = 0;
-  const DEL_BATCH = 500;
-  while (true) {
-    // Delete a batch — use x range to satisfy PostgREST filter requirement
-    const { data, error } = await supabase
-      .from(TABLE)
-      .select("x")
-      .limit(DEL_BATCH)
-      .gte("x", -2147483648);
-    if (error) {
-      console.error("Delete-check error:", error.message);
-      break;
-    }
-    if (!data || data.length === 0) break;
-    // Delete just these x values in range
-    const idsToDelete = data.map(r => `(${r.x},${r.y})`);
-    // Use upsert with all-null to delete? No — use delete with a match on a subset
-    // Actually, simplest: delete by exact PK using multiple eqs won't work for OR.
-    // Instead: delete using a filter that matches all rows.
-    // PostgREST requires a filter. We can filter on x >= min_x and x <= max_x
-    // for each batch.
-    const { error: delError } = await supabase
-      .from(TABLE)
-      .delete()
-      .gte("x", data[0].x)
-      .lte("x", data[data.length - 1].x);
-    if (delError) {
-      console.error("Batch delete error:", delError.message);
-      console.error("Try running the SQL migration manually instead:");
-      console.log(`
-ALTER TABLE ${TABLE}
-  DROP CONSTRAINT IF EXISTS ${TABLE}_color_check,
-  ALTER COLUMN color TYPE INTEGER USING NULLIF(color, '')::INTEGER,
-  ALTER COLUMN color SET NOT NULL;
-ALTER TABLE ${TABLE}
-  ADD CONSTRAINT ${TABLE}_color_check CHECK (color >= 0 AND color <= 26);
-      `);
-      process.exit(1);
-    }
-    totalDeleted += data.length;
-    if (data.length < DEL_BATCH) break;
-  }
-  console.log(`  Deleted ${totalDeleted} old rows`);
-
-  // Phase 3: Insert with numeric codes
-  console.log("Phase 3: Inserting pixels with numeric color codes...");
+// ── Phase 2: Upsert codes into the table ──
+async function upsertCodes(pixelMap) {
   const pixelArr = Array.from(pixelMap, ([key, code]) => {
     const [x, y] = key.split(",").map(Number);
     return { x, y, color: code };
@@ -236,38 +178,131 @@ ALTER TABLE ${TABLE}
     return a.x - b.x || a.y - b.y;
   });
 
+  console.log(`Upserting ${pixelArr.length} pixels with numeric codes...`);
   let uploaded = 0;
-  const INS_BATCH = 1000;
-  for (let i = 0; i < pixelArr.length; i += INS_BATCH) {
-    const batch = pixelArr.slice(i, i + INS_BATCH);
+  const UPSERT_BATCH = 1000;
+
+  for (let i = 0; i < pixelArr.length; i += UPSERT_BATCH) {
+    const batch = pixelArr.slice(i, i + UPSERT_BATCH);
     const { error } = await supabase.from(TABLE).upsert(batch, { onConflict: ["x", "y"] });
+
     if (error) {
-      console.error(`  Batch ${i / INS_BATCH + 1} failed:`, error.message);
-      console.error("If this is a CHECK constraint error on the color column,");
-      console.error("run the SQL schema fix shown above, then re-run this script.");
+      console.error(`  UPSERT FAILED at batch ${i / UPSERT_BATCH + 1}:`, error.message);
+      console.error("\n  → The table column has the old CHECK constraint for hex strings.");
+      console.error("  → Original data is safe (no rows were modified).");
+      console.error("  → Run this SQL in Supabase SQL Editor, then re-run with --restore:\n");
+      console.log(SCHEMA_SQL);
       process.exit(1);
     }
     uploaded += batch.length;
-    if (uploaded % 5000 === 0) {
+    if (uploaded % 5000 === 0 || uploaded === pixelArr.length) {
       console.log(`  Progress: ${uploaded}/${pixelArr.length}`);
     }
   }
 
-  console.log(`Migration complete: ${uploaded} pixels converted to numeric codes.`);
-  console.log("\n=== IMPORTANT: Run this SQL in your Supabase SQL Editor ===");
-  console.log(`
-ALTER TABLE ${TABLE}
-  DROP CONSTRAINT IF EXISTS ${TABLE}_color_check,
-  ALTER COLUMN color TYPE INTEGER USING NULLIF(color, '')::INTEGER,
-  ALTER COLUMN color SET NOT NULL;
-ALTER TABLE ${TABLE}
-  ADD CONSTRAINT ${TABLE}_color_check CHECK (color >= 0 AND color <= 26);
-ALTER INDEX IF EXISTS ${TABLE}_pkey REINDEX;
-`);
-  console.log("=== Server already handles both formats, so it works before AND after this SQL ===");
+  console.log("\nMigration complete: " + uploaded + " pixels now store numeric codes.");
+  if (uploaded > 0) {
+    console.log("Column may still be TEXT — for optimal storage, run:");
+    console.log(SCHEMA_SQL);
+    console.log("Then: node migrate-colors-to-codes.js --restore");
+  }
+  console.log("\n=== Server handles both formats, so it works before AND after SQL ===");
 }
 
-migrate().catch(e => {
+// ── Restore from backup file ──
+async function restoreFromBackup() {
+  if (!fs.existsSync(BACKUP_FILE)) {
+    console.error("No backup file found:", BACKUP_FILE);
+    console.error("Run the script first (without --restore) to generate a backup.");
+    process.exit(1);
+  }
+
+  const raw = fs.readFileSync(BACKUP_FILE, "utf-8");
+  const pixelArr = JSON.parse(raw);
+  console.log(`Restoring ${pixelArr.length} pixels from backup...`);
+
+  let uploaded = 0;
+  const BATCH = 1000;
+  for (let i = 0; i < pixelArr.length; i += BATCH) {
+    const batch = pixelArr.slice(i, i + BATCH);
+    const { error } = await supabase.from(TABLE).upsert(batch, { onConflict: ["x", "y"] });
+    if (error) {
+      console.error(`Batch ${i / BATCH + 1} failed:`, error.message);
+      console.error("Run the SQL schema fix first, then re-run with --restore.");
+      process.exit(1);
+    }
+    uploaded += batch.length;
+    if (uploaded % 5000 === 0) console.log(`  Progress: ${uploaded}/${pixelArr.length}`);
+  }
+  console.log(`Restore complete: ${uploaded} pixels inserted with numeric codes.`);
+  // Optionally remove backup
+  // fs.unlinkSync(BACKUP_FILE);
+}
+
+// ── Main ──
+async function main() {
+  if (isRestoreMode) {
+    await restoreFromBackup();
+    return;
+  }
+
+  console.log("Detecting column type...");
+  const columnType = await detectColumnType();
+
+  if (columnType === "integer") {
+    console.log("Column is already INTEGER — verifying all values are valid codes...");
+    let page = 0, total = 0, bad = 0;
+    const BATCH = 1000;
+    while (true) {
+      const { data, error } = await supabase
+        .from(TABLE).select("x,y,color").order("x").order("y")
+        .range(page * BATCH, page * BATCH + BATCH - 1);
+      if (error) { console.error("Read error:", error.message); break; }
+      if (!data || data.length === 0) break;
+      for (const row of data) {
+        const code = row.color;
+        if (typeof code !== "number" || !VALID_CODES.has(code)) bad++;
+        total++;
+      }
+      if (data.length < BATCH) break;
+      page++;
+    }
+    console.log(`Verified ${total} pixels, ${bad} invalid.`);
+    if (bad > 0) {
+      console.log("Some invalid values found. You may need to investigate.");
+    } else {
+      console.log("All values are valid numeric codes. Migration complete!");
+    }
+    return;
+  }
+
+  if (columnType === null) {
+    console.log("Table is empty. Run 'node migrate-to-supabase.js' first to create table + data.");
+    return;
+  }
+
+  console.log("Column is TEXT (hex strings). Converting to numeric codes...");
+
+  // Read + convert
+  const pixelMap = await readAndConvert();
+  if (pixelMap.size === 0) {
+    console.log("No valid pixels to migrate.");
+    return;
+  }
+
+  // Save local backup (just in case)
+  const backupArr = Array.from(pixelMap, ([key, code]) => {
+    const [x, y] = key.split(",").map(Number);
+    return { x, y, color: code };
+  });
+  fs.writeFileSync(BACKUP_FILE, JSON.stringify(backupArr));
+  console.log(`  Backup saved to ${BACKUP_FILE}`);
+
+  // Upsert (safe: old data not deleted if upsert fails)
+  await upsertCodes(pixelMap);
+}
+
+main().catch(e => {
   console.error("Migration failed:", e.message);
   process.exit(1);
 });

@@ -28,14 +28,21 @@ const ERASER_CODE = 255; // special sentinel, never stored in DB
 const ERASER_COLOR = "#ffffff";
 
 // Convert hex string or numeric code to a numeric code (0–26) or ERASER_CODE.
+// Handles: numeric codes, hex strings (legacy), numeric-looking text (edge case).
 // Returns undefined for invalid colors.
 function normalizeColor(color) {
   if (typeof color === "number" && Number.isInteger(color)) {
-    if (color === ERASER_CODE) return ERASER_CODE;
-    if (color >= 0 && color <= 26) return color;
+    if (color === ERASER_CODE || (color >= 0 && color <= 26)) return color;
     return undefined;
   }
   if (typeof color !== "string") return undefined;
+  // Check for numeric code stored as text (e.g. "5")
+  if (/^\d+$/.test(color)) {
+    const num = parseInt(color, 10);
+    if (num === ERASER_CODE || (num >= 0 && num <= 26)) return num;
+    return undefined;
+  }
+  // Legacy hex string
   let normalized = color.toLowerCase();
   if (normalized === "#7fd3e0") normalized = "#7fd3e6"; // legacy palette rename
   if (normalized === ERASER_COLOR) return ERASER_CODE;

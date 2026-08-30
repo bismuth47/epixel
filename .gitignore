@@ -4,4 +4,5 @@ node_modules/
 .DS_Store
 canvas.json
 canvas.json.backup*
+canvas-codes-backup*
 supabase-backup*.json
