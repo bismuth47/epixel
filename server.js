@@ -115,7 +115,7 @@ async function saveToSupabase() {
 async function loadFromSupabaseBatch() {
   console.log("[load] loading from Supabase (batched)...");
   let from = 0;
-  const batchSize = 10000;
+  const batchSize = 1000;
   while (true) {
     const { data, error } = await supabase
       .from(SUPABASE_TABLE)
