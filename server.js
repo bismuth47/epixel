@@ -45,6 +45,10 @@ const canvasData = new Map();
 let dirty = false;
 let ready = false;
 let loadError = null;
+// Incremental save state for Supabase (avoid full 66k delete+upsert that blocks event loop)
+let isSaving = false;
+const pendingUpserts = new Map(); // "x,y" -> color
+const pendingDeletes = new Set(); // "x,y"
 
 async function loadFromSupabase() {
   console.log("[load] loading from Supabase...");
@@ -81,33 +85,62 @@ async function loadFromSupabase() {
 
 async function saveToSupabase() {
   if (!supabase) return false;
-  if (!dirty) return true;
+  if (isSaving) return true;
+  if (pendingUpserts.size === 0 && pendingDeletes.size === 0) return true;
 
-  console.log(`[save] saving ${canvasData.size} pixels to Supabase...`);
-  const payload = Array.from(canvasData, ([k, color]) => {
-    const [x, y] = k.split(",").map(Number);
-    return { x, y, color };
-  });
+  isSaving = true;
+  // snapshot and clear to allow new draws during save
+  const upserts = new Map(pendingUpserts);
+  const deletes = new Set(pendingDeletes);
+  pendingUpserts.clear();
+  pendingDeletes.clear();
 
-  // Delete all existing rows, then insert fresh snapshot
-  // (Simpler approach for full sync; could use upsert for partial updates)
+  const totalOps = upserts.size + deletes.size;
+  console.log(`[save] saving ${totalOps} ops (upserts=${upserts.size} deletes=${deletes.size}) totalPixels=${canvasData.size}...`);
   try {
-    await supabase.from(SUPABASE_TABLE).delete().neq("x", null);
-    if (payload.length > 0) {
-      const { error, rowCount } = await supabase
-        .from(SUPABASE_TABLE)
-        .upsert(payload, { onConflict: ["x", "y"] });
-
-      if (error) {
-        console.error("[save] Supabase upsert error:", error.message);
-        return false;
+    // Deletes first (batched, parallel 50 at a time to avoid blocking)
+    if (deletes.size > 0) {
+      const delKeys = Array.from(deletes);
+      for (let i = 0; i < delKeys.length; i += 100) {
+        const batch = delKeys.slice(i, i + 100);
+        const results = await Promise.all(batch.map(k => {
+          const [x, y] = k.split(",").map(Number);
+          return supabase.from(SUPABASE_TABLE).delete().eq("x", x).eq("y", y);
+        }));
+        for (const r of results) {
+          if (r.error) console.error("[save] delete error:", r.error.message);
+        }
       }
     }
-    dirty = false;
-    console.log(`[save] ${canvasData.size} pixels saved to Supabase`);
+    // Upserts in 1000 batches (Supabase limit)
+    if (upserts.size > 0) {
+      const payload = Array.from(upserts, ([k, color]) => {
+        const [x, y] = k.split(",").map(Number);
+        return { x, y, color };
+      });
+      for (let i = 0; i < payload.length; i += 1000) {
+        const batch = payload.slice(i, i + 1000);
+        const { error } = await supabase
+          .from(SUPABASE_TABLE)
+          .upsert(batch, { onConflict: ["x", "y"] });
+        if (error) {
+          console.error("[save] Supabase upsert error:", error.message);
+          // re-queue failed batch
+          for (const p of batch) pendingUpserts.set(`${p.x},${p.y}`, p.color);
+          isSaving = false;
+          return false;
+        }
+      }
+    }
+    console.log(`[save] ${totalOps} ops saved, remaining pending=${pendingUpserts.size + pendingDeletes.size}`);
+    isSaving = false;
     return true;
   } catch (e) {
     console.error("[save] Supabase error:", e.message);
+    // re-queue on exception
+    for (const [k, v] of upserts) pendingUpserts.set(k, v);
+    for (const k of deletes) pendingDeletes.add(k);
+    isSaving = false;
     return false;
   }
 }
@@ -184,12 +217,13 @@ async function loadCanvas() {
 }
 
 function saveCanvas() {
-  if (!dirty) return;
   if (supabase) {
+    if (pendingUpserts.size === 0 && pendingDeletes.size === 0) return;
     saveToSupabase().catch(e => {
       console.error("[save] failed:", e.message);
     });
   } else {
+    if (!dirty) return;
     try {
       const obj = Object.fromEntries(canvasData);
       fs.writeFileSync(DATA_FILE, JSON.stringify(obj));
@@ -206,13 +240,15 @@ loadCanvas();
 // periodic save
 setInterval(saveCanvas, SAVE_INTERVAL_MS);
 // graceful shutdown
-process.on("SIGINT", () => {
+process.on("SIGINT", async () => {
   console.log("\n[SIGINT] saving...");
-  saveCanvas();
+  if (supabase) await saveToSupabase();
+  else saveCanvas();
   process.exit(0);
 });
-process.on("SIGTERM", () => {
-  saveCanvas();
+process.on("SIGTERM", async () => {
+  if (supabase) await saveToSupabase();
+  else saveCanvas();
   process.exit(0);
 });
 
@@ -388,15 +424,17 @@ io.on("connection", (socket) => {
     const normalized = color.toLowerCase();
     const key = `${x},${y}`;
     if (normalized === ERASER_COLOR) {
-      if (canvasData.has(key)) {
-        canvasData.delete(key);
-        dirty = true;
-      } else {
-        dirty = true;
-      }
+      const had = canvasData.has(key);
+      if (had) canvasData.delete(key);
+      // track delete for Supabase, remove from pending upserts
+      pendingUpserts.delete(key);
+      pendingDeletes.add(key);
+      if (!supabase) dirty = true;
     } else {
       canvasData.set(key, normalized);
-      dirty = true;
+      pendingDeletes.delete(key);
+      pendingUpserts.set(key, normalized);
+      if (!supabase) dirty = true;
     }
     io.emit("draw", { x, y, color: normalized });
   });
@@ -410,12 +448,16 @@ io.on("connection", (socket) => {
       const key = `${x},${y}`;
       if (normalized === ERASER_COLOR) {
         if (canvasData.has(key)) canvasData.delete(key);
+        pendingUpserts.delete(key);
+        pendingDeletes.add(key);
       } else {
         canvasData.set(key, normalized);
+        pendingDeletes.delete(key);
+        pendingUpserts.set(key, normalized);
       }
       normalizedBatch.push({ x, y, color: normalized });
     }
-    dirty = true;
+    if (!supabase) dirty = true;
     io.emit("drawBatch", normalizedBatch);
   });
 
