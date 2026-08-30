@@ -1107,6 +1107,9 @@
       }
     }
 
+    // グリッドをピクセルの上で低不透明度で再描画（色ピクセル上に微妙なグリッドを表示）
+    drawGrid(0.15);
+
     if(isDrawing && drawStartGrid && drawCurrentGrid){
       if(currentTool===TOOLS.RECT || currentTool===TOOLS.CIRCLE || currentTool===TOOLS.LINE){
         let x0=drawStartGrid.x, y0=drawStartGrid.y, x1=drawCurrentGrid.x, y1=drawCurrentGrid.y;
