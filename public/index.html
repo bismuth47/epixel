@@ -1059,6 +1059,39 @@
     // グリッド表示時のみピクセル間に小隙間を空けてグリッド線が見えるようにする
     const pad = canDrawGrid ? -0.4 / scale : 0.6 / scale;
 
+    // グリッド描画（不透明度倍率を指定）: ピクセル前は通常不透明度、ピクセル上は低不透明度
+    const drawGrid = (alphaMult) => {
+      if (!canDrawGrid) return;
+      // ズームアウト時は線が密集するため不透明度を上げても見やすく調整
+      const pixelCssSize = PIXEL_SIZE * scale;
+      const denseBoost = Math.max(0, 18 - pixelCssSize) * 0.012;
+      const gridA = Math.min(0.10, 0.05 + denseBoost) * alphaMult;
+      const axisA = Math.min(0.30, gridA * 1.8);
+      ctx.strokeStyle = `rgba(0,0,0,${gridA.toFixed(3)})`;
+      ctx.lineWidth = 1 / scale;
+      ctx.beginPath();
+      for (let gx = minGridX; gx <= maxGridX; gx++) {
+        const wx = gx * PIXEL_SIZE;
+        ctx.moveTo(wx, minWorldY);
+        ctx.lineTo(wx, maxWorldY);
+      }
+      for (let gy = minGridY; gy <= maxGridY; gy++) {
+        const wy = gy * PIXEL_SIZE;
+        ctx.moveTo(minWorldX, wy);
+        ctx.lineTo(maxWorldX, wy);
+      }
+      ctx.stroke();
+      ctx.strokeStyle = `rgba(0,0,0,${axisA.toFixed(3)})`;
+      ctx.lineWidth = 1.5 / scale;
+      ctx.beginPath();
+      ctx.moveTo(0, minWorldY); ctx.lineTo(0, maxWorldY);
+      ctx.moveTo(minWorldX, 0); ctx.lineTo(maxWorldX, 0);
+      ctx.stroke();
+    };
+
+    // グリッドをピクセルの下で通常不透明度で描画（隙間から見える）
+    drawGrid(1.0);
+
     // Viewport Culling (B) + A: no per-cell string key — iterate only rendered pixels in viewport tiles
     const vpTiles = getTilesForViewport();
     for(const tile of vpTiles){
@@ -1074,33 +1107,8 @@
       }
     }
 
-    if (canDrawGrid) {
-      // ズームアウト時は線が密集するため不透明度を上げても見やすく調整
-      const pixelCssSize = PIXEL_SIZE * scale;
-      const denseBoost = Math.max(0, 18 - pixelCssSize) * 0.012;
-      const gridAlpha = Math.min(0.10, 0.05 + denseBoost);
-      const axisAlpha = Math.min(0.30, gridAlpha * 1.8);
-      ctx.strokeStyle = `rgba(0,0,0,${gridAlpha.toFixed(3)})`;
-      ctx.lineWidth = 1 / scale;
-      ctx.beginPath();
-      for (let gx = minGridX; gx <= maxGridX; gx++) {
-        const wx = gx * PIXEL_SIZE;
-        ctx.moveTo(wx, minWorldY);
-        ctx.lineTo(wx, maxWorldY);
-      }
-      for (let gy = minGridY; gy <= maxGridY; gy++) {
-        const wy = gy * PIXEL_SIZE;
-        ctx.moveTo(minWorldX, wy);
-        ctx.lineTo(maxWorldX, wy);
-      }
-      ctx.stroke();
-      ctx.strokeStyle = `rgba(0,0,0,${axisAlpha.toFixed(3)})`;
-      ctx.lineWidth = 1.5 / scale;
-      ctx.beginPath();
-      ctx.moveTo(0, minWorldY); ctx.lineTo(0, maxWorldY);
-      ctx.moveTo(minWorldX, 0); ctx.lineTo(maxWorldX, 0);
-      ctx.stroke();
-    }
+    // グリッドをピクセルの上で低不透明度で再描画（色ピクセル上のグリッドを薄く）
+    drawGrid(0.3);
 
     if(isDrawing && drawStartGrid && drawCurrentGrid){
       if(currentTool===TOOLS.RECT || currentTool===TOOLS.CIRCLE || currentTool===TOOLS.LINE){
