@@ -1056,8 +1056,8 @@
     const maxGridY = Math.floor(maxWorldY / PIXEL_SIZE) + 1;
 
     const canDrawGrid = isGridVisible();
-    // ピクセル間に小隙間を空けてグリッド線が見えるようにする
-    const pad = -0.4 / scale;
+    // グリッド表示時のみピクセル間に小隙間を空けてグリッド線が見えるようにする
+    const pad = canDrawGrid ? -0.4 / scale : 0.6 / scale;
 
     // Viewport Culling (B) + A: no per-cell string key — iterate only rendered pixels in viewport tiles
     const vpTiles = getTilesForViewport();
