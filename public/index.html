@@ -1056,8 +1056,23 @@
     const maxGridY = Math.floor(maxWorldY / PIXEL_SIZE) + 1;
 
     const canDrawGrid = isGridVisible();
-    // 擬似グリッド対策: 隣接ピクセル間の隙間を埋めるためのオーバーラップ量（0.6画面px）
-    const pad = 0.6 / scale;
+    // ピクセル間に小隙間を空けてグリッド線が見えるようにする
+    const pad = -0.4 / scale;
+
+    // Viewport Culling (B) + A: no per-cell string key — iterate only rendered pixels in viewport tiles
+    const vpTiles = getTilesForViewport();
+    for(const tile of vpTiles){
+      const tmap = tilePixels.get(tile.key);
+      if(!tmap) continue;
+      for(const [k,color] of tmap){
+        const comma = k.indexOf(',');
+        const x = parseInt(k.slice(0, comma), 10);
+        const y = parseInt(k.slice(comma+1), 10);
+        if(x < minGridX || x > maxGridX || y < minGridY || y > maxGridY) continue;
+        ctx.fillStyle = color;
+        ctx.fillRect(x * PIXEL_SIZE, y * PIXEL_SIZE, PIXEL_SIZE + pad, PIXEL_SIZE + pad);
+      }
+    }
 
     if (canDrawGrid) {
       // ズームアウト時は線が密集するため不透明度を上げても見やすく調整
@@ -1085,21 +1100,6 @@
       ctx.moveTo(0, minWorldY); ctx.lineTo(0, maxWorldY);
       ctx.moveTo(minWorldX, 0); ctx.lineTo(maxWorldX, 0);
       ctx.stroke();
-    }
-
-    // Viewport Culling (B) + A: no per-cell string key — iterate only rendered pixels in viewport tiles
-    const vpTiles = getTilesForViewport();
-    for(const tile of vpTiles){
-      const tmap = tilePixels.get(tile.key);
-      if(!tmap) continue;
-      for(const [k,color] of tmap){
-        const comma = k.indexOf(',');
-        const x = parseInt(k.slice(0, comma), 10);
-        const y = parseInt(k.slice(comma+1), 10);
-        if(x < minGridX || x > maxGridX || y < minGridY || y > maxGridY) continue;
-        ctx.fillStyle = color;
-        ctx.fillRect(x * PIXEL_SIZE, y * PIXEL_SIZE, PIXEL_SIZE + pad, PIXEL_SIZE + pad);
-      }
     }
 
     if(isDrawing && drawStartGrid && drawCurrentGrid){
@@ -1171,24 +1171,24 @@
             const pickedColor = getPixel(hoverGrid.x,hoverGrid.y) || ERASER_COLOR;
             ctx.fillStyle = pickedColor;
             ctx.globalAlpha = 0.5;
-            ctx.fillRect(hoverGrid.x * PIXEL_SIZE, hoverGrid.y * PIXEL_SIZE, PIXEL_SIZE, PIXEL_SIZE);
+            ctx.fillRect(hoverGrid.x * PIXEL_SIZE, hoverGrid.y * PIXEL_SIZE, PIXEL_SIZE + pad, PIXEL_SIZE + pad);
             ctx.globalAlpha = 1;
             ctx.strokeStyle = "#6cf";
             ctx.lineWidth = 2 / scale;
             ctx.setLineDash([4 / scale, 3 / scale]);
-            ctx.strokeRect(hoverGrid.x * PIXEL_SIZE, hoverGrid.y * PIXEL_SIZE, PIXEL_SIZE, PIXEL_SIZE);
+            ctx.strokeRect(hoverGrid.x * PIXEL_SIZE, hoverGrid.y * PIXEL_SIZE, PIXEL_SIZE + pad, PIXEL_SIZE + pad);
             ctx.setLineDash([]);
           } else {
           const isEraser = selectedColor.toLowerCase() === ERASER_COLOR;
           if (isEraser) {
             ctx.fillStyle = "#ffffff";
             ctx.globalAlpha = 0.9;
-            ctx.fillRect(hoverGrid.x * PIXEL_SIZE, hoverGrid.y * PIXEL_SIZE, PIXEL_SIZE, PIXEL_SIZE);
+            ctx.fillRect(hoverGrid.x * PIXEL_SIZE, hoverGrid.y * PIXEL_SIZE, PIXEL_SIZE + pad, PIXEL_SIZE + pad);
             ctx.globalAlpha = 1;
             ctx.strokeStyle = "rgba(220, 40, 40, 0.9)";
             ctx.lineWidth = 1.5 / scale;
             ctx.setLineDash([4 / scale, 3 / scale]);
-            ctx.strokeRect(hoverGrid.x * PIXEL_SIZE, hoverGrid.y * PIXEL_SIZE, PIXEL_SIZE, PIXEL_SIZE);
+            ctx.strokeRect(hoverGrid.x * PIXEL_SIZE, hoverGrid.y * PIXEL_SIZE, PIXEL_SIZE + pad, PIXEL_SIZE + pad);
             ctx.setLineDash([]);
             ctx.strokeStyle = "rgba(220, 40, 40, 0.7)";
             ctx.lineWidth = 1.2 / scale;
@@ -1200,12 +1200,12 @@
           } else {
             ctx.fillStyle = selectedColor;
             ctx.globalAlpha = currentTool===TOOLS.FILL ? 0.25 : 0.5;
-            ctx.fillRect(hoverGrid.x * PIXEL_SIZE, hoverGrid.y * PIXEL_SIZE, PIXEL_SIZE, PIXEL_SIZE);
+            ctx.fillRect(hoverGrid.x * PIXEL_SIZE, hoverGrid.y * PIXEL_SIZE, PIXEL_SIZE + pad, PIXEL_SIZE + pad);
             ctx.globalAlpha = 1;
             ctx.strokeStyle = currentTool===TOOLS.FILL ? "rgba(0,120,255,0.9)" : "rgba(0,0,0,0.7)";
             ctx.lineWidth = 1.5 / scale;
             if(currentTool===TOOLS.FILL) ctx.setLineDash([3/scale,3/scale]);
-            ctx.strokeRect(hoverGrid.x * PIXEL_SIZE, hoverGrid.y * PIXEL_SIZE, PIXEL_SIZE, PIXEL_SIZE);
+            ctx.strokeRect(hoverGrid.x * PIXEL_SIZE, hoverGrid.y * PIXEL_SIZE, PIXEL_SIZE + pad, PIXEL_SIZE + pad);
             ctx.setLineDash([]);
           }
           }
