@@ -1090,7 +1090,7 @@
     };
 
     // グリッドをピクセルの下で通常不透明度で描画（隙間から見える）
-    drawGrid(1.2);
+    drawGrid(0.75);
 
     // Viewport Culling (B) + A: no per-cell string key — iterate only rendered pixels in viewport tiles
     const vpTiles = getTilesForViewport();
@@ -1108,7 +1108,7 @@
     }
 
     // グリッドをピクセルの上で再描画（色ピクセル上に見えるグリッド）
-    drawGrid(2.0);
+    drawGrid(3.0);
 
     if(isDrawing && drawStartGrid && drawCurrentGrid){
       if(currentTool===TOOLS.RECT || currentTool===TOOLS.CIRCLE || currentTool===TOOLS.LINE){
