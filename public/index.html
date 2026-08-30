@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Everyone Draw</title>
+<title>epixel</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   html, body { width: 100%; height: 100%; overflow: hidden; background: #ffffff; font-family: system-ui, sans-serif; overscroll-behavior: none; }
@@ -95,9 +95,18 @@
     #bottomBar { gap: 8px; bottom: 12px; }
     #gridWarn { top: auto; bottom: 140px; }
   }
+  #loading {
+    position: fixed; inset: 0; background: rgba(255,255,255,0.92); display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 100; gap: 16px; transition: opacity 0.3s;
+  }
+  #loading.hidden { opacity: 0; pointer-events: none; }
+  #loading .spinner { width: 36px; height: 36px; border: 4px solid #ddd; border-top-color: #333; border-radius: 50%; animation: spin 0.8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #loading p { font-size: 14px; color: #333; }
+  #loading small { font-size: 11px; color: #888; max-width: 80vw; text-align: center; line-height: 1.4; }
 </style>
 </head>
 <body>
+<div id="loading"><div class="spinner"></div><p id="loadingText">読み込み中...</p><small id="loadingSub">初回はサーバー起動に最大30秒かかることがあります</small></div>
 <canvas id="canvas"></canvas>
 
 <div id="topbar">
@@ -131,21 +140,25 @@
   const statusEl = document.getElementById("status");
   const connTextEl = document.getElementById("connText");
   const userCountEl = document.getElementById("userCount");
+  const loadingEl = document.getElementById("loading");
+  const loadingTextEl = document.getElementById("loadingText");
+  const loadingSubEl = document.getElementById("loadingSub");
 
   // ---- Config ----
   const PIXEL_SIZE = 20; // world units per dot
   const MIN_SCALE = 0.15;
   const MAX_SCALE = 30;
   
-  // より近く（大きくズームイン）なるまでグリッドを非表示にするための閾値調整
-  const GRID_SHOW_THRESHOLD = 18; // CSS px per dot（12 -> 18に変更）
-  const MAX_GRID_LINES_PER_AXIS = 80;  // 片軸あたりの最大線本数（150 -> 80に変更）
+  // ズームインで他ツールが使用可になるまでグリッドを非表示
+  const GRID_SHOW_THRESHOLD = 28; // CSS px per dot（18 -> 28に変更: より寄らないと表示しない）
+  const MAX_GRID_LINES_PER_AXIS = 50;  // 片軸あたりの最大線本数（80 -> 50に変更）
 
   const COLORS = [
     "#175145","#2e8065","#51b341","#9bd547","#fff971","#ff7f4f",
-    "#ff4f4f","#ee3046","#df426e","#a62654","#621b52","#371848",
-    "#0c082a","#261152","#272573","#4876bb","#7fd3e6","#c7f7f2",
-    "#ffffff","#d29c8a","#9e4d4d","#712835","#5d1835","#35082a"
+    "#ff4f4f","#ee3046","#df426e","#ff88dd","#a62654","#621b52",
+    "#371848","#0c082a","#261152","#272573","#4876bb","#7fd3e6",
+    "#c7f7f2","#ffffff","#bbbbbb","#666666","#fdcbb0","#d29c8a",
+    "#9e4d4d","#712835","#5d1835","#35082a"
   ];
   const ERASER_COLOR = "#ffffff";
   const TOOLS = { DOT: 'dot', PEN: 'pen', RECT: 'rect', CIRCLE: 'circle', FILL: 'fill', LINE: 'line', SPoit: 'spoit' };
@@ -173,7 +186,40 @@
   let scale = 1; // initial 100%
   let offsetX = 0, offsetY = 0; // world coords at viewport center
   let selectedColor = COLORS[0];
-  const pixels = new Map(); // "x,y" -> color
+  const pixels = new Map(); // gx -> Map<gy,color> (A: no string key)
+  let pixelCount = 0;
+  const tilePixels = new Map(); // tileKey -> Map<"x,y",color> for B: viewport culling via tiles
+  function tileKeyFor(x,y){ return `${Math.floor(x/TILE)},${Math.floor(y/TILE)}`; }
+  function getPixel(x,y){ const col=pixels.get(x); return col ? col.get(y) : undefined; }
+  function hasPixel(x,y){ const col=pixels.get(x); return col ? col.has(y) : false; }
+  function setPixel(x,y,color){
+    const norm = color.toLowerCase();
+    let col=pixels.get(x);
+    if(!col){ col=new Map(); pixels.set(x,col); }
+    const prev=col.get(y);
+    if(prev===norm) return false;
+    if(prev===undefined) pixelCount++;
+    col.set(y,norm);
+    const tk=tileKeyFor(x,y);
+    let tmap=tilePixels.get(tk);
+    if(!tmap){ tmap=new Map(); tilePixels.set(tk,tmap); }
+    tmap.set(`${x},${y}`, norm);
+    // 同一セッションで再生成しない: ローカル生成タイルは即取得済み扱い
+    if(!fetchedTiles.has(tk) && !fetchingTiles.has(tk)) fetchedTiles.add(tk);
+    return true;
+  }
+  function deletePixel(x,y){
+    const col=pixels.get(x);
+    if(!col || !col.has(y)) return false;
+    col.delete(y);
+    pixelCount--;
+    if(col.size===0) pixels.delete(x);
+    const tk=tileKeyFor(x,y);
+    const tmap=tilePixels.get(tk);
+    if(tmap){ tmap.delete(`${x},${y}`); if(tmap.size===0) tilePixels.delete(tk); }
+    return true;
+  }
+  function clearPixels(){ pixels.clear(); tilePixels.clear(); pixelCount=0; }
   let currentTool = TOOLS.DOT;
   let spoitPrevTool = null; // tool to return to after picking color with SPoit
   let shapeFilled = false; // for rect/circle: false=枠線, true=塗りつぶし
@@ -213,17 +259,80 @@
   let hoverGrid = null; // {x,y}
   let gridWarnTimer = null;
 
+  // viewport fetch state (tile-based)
+  let initialLoaded = false;
+  let fetchTimer = null;
+  const TILE = 100; // 100x100 per request (fits server limits)
+  const MAX_TILES_PER_FETCH = 25; // 25*10k=250k cells max
+  const fetchedTiles = new Set(); // "tx,ty"
+  const fetchingTiles = new Set();
+  let fetchingCount = 0;
+  function hideLoading(){
+    if(loadingEl) loadingEl.classList.add("hidden");
+    setTimeout(()=>{ if(loadingEl) loadingEl.style.display="none"; }, 400);
+  }
+  function showLoading(text, sub){
+    if(loadingEl){ loadingEl.style.display="flex"; loadingEl.classList.remove("hidden"); }
+    if(text && loadingTextEl) loadingTextEl.textContent = text;
+    if(sub !== undefined && loadingSubEl) loadingSubEl.textContent = sub;
+  }
+
+  // ---- Rate limit: 2 draws per 1000ms (all tools, stroke unit) ----
+  let drawTimes = [];
+  const DRAW_LIMIT = 3;
+  const DRAW_WINDOW_MS = 1000;
+  let drawLimitWarnTimer = null;
+  function canDraw(){
+    const now = Date.now();
+    drawTimes = drawTimes.filter(t => now - t < DRAW_WINDOW_MS);
+    return drawTimes.length < DRAW_LIMIT;
+  }
+  function recordDraw(){ drawTimes.push(Date.now()); }
+  function getDrawCooldownMs(){
+    if(drawTimes.length < DRAW_LIMIT) return 0;
+    const oldest = drawTimes[0];
+    return Math.max(0, DRAW_WINDOW_MS - (Date.now() - oldest));
+  }
+  function showDrawLimitWarn(){
+    const ms = getDrawCooldownMs();
+    const sec = (ms/1000).toFixed(1);
+    gridWarn.textContent = `1秒に3回までです（あと${sec}秒）`;
+    gridWarn.style.display = 'block';
+    clearTimeout(gridWarnTimer);
+    clearTimeout(drawLimitWarnTimer);
+    const delay = ms > 0 ? ms + 200 : 1200;
+    drawLimitWarnTimer = setTimeout(()=>{
+      gridWarn.style.display='none';
+      gridWarn.textContent = 'グリッド表示時のみ使用できます。ズームインしてください';
+    }, delay);
+  }
+
   // ---- Undo/Redo (local only, own operations) ----
   const MAX_UNDO = 50;
   let undoStack = [];
   let redoStack = [];
-  function pushUndo(entry){
-    if(!entry || !entry.pixels || entry.pixels.length===0) return;
-    undoStack.push(entry);
-    if(undoStack.length > MAX_UNDO) undoStack.shift();
-    redoStack = [];
-    updateUndoUI();
-  }
+   function pushUndo(entry){
+     if(!entry || !entry.pixels || entry.pixels.length===0) return;
+     undoStack.push(entry);
+     if(undoStack.length > MAX_UNDO) undoStack.shift();
+     redoStack = [];
+     updateUndoUI();
+   }
+   function cancelPenStroke(){
+     if(!penStrokeMap || penStrokeMap.size<=0) return;
+     for(const p of penStrokeMap.values()){
+       if(p.prev){ setPixel(p.x,p.y, p.prev); }
+       else { deletePixel(p.x,p.y); }
+     }
+     if(socket && socket.connected){
+       const batch=[];
+       for(const p of penStrokeMap.values()){
+         batch.push(p.prev===null ? {x:p.x,y:p.y,color:"#ffffff"} : {x:p.x,y:p.y,color:p.prev});
+       }
+       socket.emit("drawBatch", batch);
+     }
+     scheduleRender(); updateInfo();
+   }
   function updateUndoUI(){
     const ub = document.getElementById("undoBtn");
     const rb = document.getElementById("redoBtn");
@@ -232,10 +341,9 @@
   }
   function applyPixels(pixelList, colorOverride){
     for(const p of pixelList){
-      const k=`${p.x},${p.y}`;
       const col = (colorOverride !== undefined ? colorOverride : p.color);
-      if(col === ERASER_COLOR || col === null) pixels.delete(k);
-      else pixels.set(k, col.toLowerCase());
+      if(col === ERASER_COLOR || col === null) deletePixel(p.x,p.y);
+      else setPixel(p.x,p.y, col);
     }
   }
   function undo(){
@@ -243,11 +351,10 @@
     const entry = undoStack.pop();
     const revert = entry.pixels.map(p=>({x:p.x, y:p.y, color: p.prev || ERASER_COLOR}));
     for(const p of entry.pixels){
-      const k=`${p.x},${p.y}`;
-      if(p.prev === null) pixels.delete(k);
-      else pixels.set(k, p.prev.toLowerCase());
+      if(p.prev === null) deletePixel(p.x,p.y);
+      else setPixel(p.x,p.y, p.prev);
     }
-    render(); updateInfo(); updateUndoUI();
+    scheduleRender(); updateInfo(); updateUndoUI();
     redoStack.push(entry);
     updateUndoUI();
     if(socket && socket.connected){
@@ -260,11 +367,10 @@
     const entry = redoStack.pop();
     const reapply = entry.pixels.map(p=>({x:p.x, y:p.y, color: p.newColor}));
     for(const p of entry.pixels){
-      const k=`${p.x},${p.y}`;
-      if(p.newColor === ERASER_COLOR || p.newColor === null) pixels.delete(k);
-      else pixels.set(k, p.newColor.toLowerCase());
+      if(p.newColor === ERASER_COLOR || p.newColor === null) deletePixel(p.x,p.y);
+      else setPixel(p.x,p.y, p.newColor);
     }
-    render(); updateInfo();
+    scheduleRender(); updateInfo();
     undoStack.push(entry);
     updateUndoUI();
     if(socket && socket.connected){
@@ -408,7 +514,7 @@
   function setShapeFilled(filled){
     shapeFilled = filled;
     updateToolUI();
-    render();
+    scheduleRender();
   }
 
   function selectTool(tool){
@@ -431,7 +537,7 @@
     penLastGrid = null;
     penStrokeMap = null;
     updateToolUI();
-    render();
+    scheduleRender();
   }
 
   function showGridWarn(){
@@ -491,6 +597,153 @@
   }
   buildToolBar();
 
+  // ---- scheduleRender (rAF debounce) ----
+  let renderQueued = false;
+  function scheduleRender(){
+    if(renderQueued) return;
+    renderQueued = true;
+    requestAnimationFrame(()=>{ renderQueued=false; render(); });
+  }
+
+  // ---- Viewport fetch (tile-based) ----
+  function getTilesForViewport(){
+    const vb = getViewportBounds();
+    const padGrid = 2;
+    const minGridX = Math.floor(vb.minWorldX / PIXEL_SIZE) - padGrid;
+    const maxGridX = Math.floor(vb.maxWorldX / PIXEL_SIZE) + padGrid;
+    const minGridY = Math.floor(vb.minWorldY / PIXEL_SIZE) - padGrid;
+    const maxGridY = Math.floor(vb.maxWorldY / PIXEL_SIZE) + padGrid;
+    let spanX = maxGridX - minGridX + 1, spanY = maxGridY - minGridY + 1;
+    // if viewport too large, clamp to center 500x500 (5 tiles)
+    if(spanX > 500 || spanY > 500){
+      const cx = Math.floor((minGridX+maxGridX)/2);
+      const cy = Math.floor((minGridY+maxGridY)/2);
+      const half = 250;
+      return getTilesForBounds(cx-half, cy-half, cx+half-1, cy+half-1);
+    }
+    return getTilesForBounds(minGridX, minGridY, maxGridX, maxGridY);
+  }
+  function getTilesForBounds(minX, minY, maxX, maxY){
+    const tiles = [];
+    const tx0 = Math.floor(minX / TILE), ty0 = Math.floor(minY / TILE);
+    const tx1 = Math.floor(maxX / TILE), ty1 = Math.floor(maxY / TILE);
+    for(let tx=tx0; tx<=tx1; tx++){
+      for(let ty=ty0; ty<=ty1; ty++){
+        tiles.push({tx,ty, x0: tx*TILE, y0: ty*TILE, x1: tx*TILE+TILE-1, y1: ty*TILE+TILE-1, key: `${tx},${ty}`});
+      }
+    }
+    // center-first: sort by distance to viewport center
+    const vb = getViewportBounds();
+    const cx = Math.floor(offsetX/PIXEL_SIZE), cy = Math.floor(offsetY/PIXEL_SIZE);
+    tiles.sort((a,b)=>{
+      const da = Math.hypot(a.tx*TILE+TILE/2 - cx, a.ty*TILE+TILE/2 - cy);
+      const db = Math.hypot(b.tx*TILE+TILE/2 - cx, b.ty*TILE+TILE/2 - cy);
+      return da-db;
+    });
+    return tiles;
+  }
+  function getGridBoundsForFetch(){
+    // compat: single rect for initial loading text
+    const vb = getViewportBounds();
+    const padGrid = 2;
+    const minGridX = Math.floor(vb.minWorldX / PIXEL_SIZE) - padGrid;
+    const maxGridX = Math.floor(vb.maxWorldX / PIXEL_SIZE) + padGrid;
+    const minGridY = Math.floor(vb.minWorldY / PIXEL_SIZE) - padGrid;
+    const maxGridY = Math.floor(vb.maxWorldY / PIXEL_SIZE) + padGrid;
+    return {x0:minGridX,y0:minGridY,x1:maxGridX,y1:maxGridY};
+  }
+  async function fetchTile(tile){
+    const key = tile.key;
+    if(fetchedTiles.has(key) || fetchingTiles.has(key)) return 0;
+    fetchingTiles.add(key);
+    fetchingCount++;
+    try{
+      const url = `/api/pixels?x0=${tile.x0}&y0=${tile.y0}&x1=${tile.x1}&y1=${tile.y1}`;
+      const res = await fetch(url);
+      if(!res.ok){
+        const txt = await res.text();
+        console.warn("[fetchTile] failed", key, res.status, txt);
+        return 0;
+      }
+      const j = await res.json();
+      const arr = j.pixels || [];
+      // chunked insert to avoid blocking pan (40k set in one frame janks)
+      const CHUNK = 2500;
+      for(let i=0;i<arr.length;i+=CHUNK){
+        const slice = arr.slice(i, i+CHUNK);
+        for(const {x,y,color} of slice){
+          if(typeof color!=="string") continue;
+          setPixel(x,y, color);
+        }
+        if(arr.length > CHUNK && i+CHUNK < arr.length){
+          // yield to render between chunks
+          await new Promise(r=> requestAnimationFrame(()=> r()));
+        }
+      }
+      fetchedTiles.add(key);
+      return arr.length;
+    }catch(e){
+      console.warn("[fetchTile] error", key, e.message);
+      return 0;
+    }finally{
+      fetchingTiles.delete(key);
+      fetchingCount--;
+    }
+  }
+  async function fetchViewport(force){
+    const tiles = getTilesForViewport();
+    // 同一セッションで再生成しない: 未取得のみを対象にし、sliceはその後に適用
+    const unfetched = tiles.filter(t=> !fetchedTiles.has(t.key) && !fetchingTiles.has(t.key));
+    if(unfetched.length===0){
+      if(force && !initialLoaded){ initialLoaded=true; hideLoading(); scheduleRender(); }
+      return;
+    }
+    const needed = unfetched.slice(0, MAX_TILES_PER_FETCH);
+    if(!initialLoaded) showLoading("ピクセルを読み込み中...", `${needed.length}タイル取得中...`);
+    // 見た瞬間に生成: pan中でも即時取得したいが、連続fetchでjankしないよう concurrency 2 に抑える
+    const CONCURRENCY = 2;
+    let total = 0;
+    for(let i=0;i<needed.length;i+=CONCURRENCY){
+      const batch = needed.slice(i, i+CONCURRENCY);
+      const results = await Promise.all(batch.map(t=> fetchTile(t)));
+      for(const n of results) total+=n;
+      scheduleRender(); updateInfo();
+      // yield between batches so pan frame is not blocked
+      if(i+CONCURRENCY < needed.length) await new Promise(r=> setTimeout(r, 16));
+    }
+    if(!initialLoaded){
+      if(loadingSubEl) loadingSubEl.textContent = `${total}件読込 (${fetchedTiles.size}タイル)`;
+      initialLoaded = true;
+      hideLoading();
+      requestAnimationFrame(()=> scheduleRender());
+    } else {
+      scheduleRender(); updateInfo();
+    }
+    if(unfetched.length > MAX_TILES_PER_FETCH){
+      setTimeout(()=> fetchViewport(false), 200);
+    }
+  }
+  let lastFetchAt = 0;
+  function scheduleViewportFetch(){
+    clearTimeout(fetchTimer);
+    // debounce for pan end: fetch 60ms after stop
+    fetchTimer = setTimeout(()=> fetchViewport(false), 60);
+  }
+  function scheduleViewportFetchThrottled(){
+    const now = Date.now();
+    if(now - lastFetchAt > 120){
+      lastFetchAt = now;
+      fetchViewport(false);
+    } else {
+      scheduleViewportFetch();
+    }
+  }
+  function triggerViewportFetchImmediate(){
+    clearTimeout(fetchTimer);
+    lastFetchAt = Date.now();
+    fetchViewport(false);
+  }
+
   // ---- Canvas sizing (HiDPI) ----
   function resize() {
     const dpr = window.devicePixelRatio || 1;
@@ -498,9 +751,12 @@
     canvas.height = Math.round(window.innerHeight * dpr);
     canvas.style.width = window.innerWidth + "px";
     canvas.style.height = window.innerHeight + "px";
-    render();
+    scheduleRender();
+    if(initialLoaded) scheduleViewportFetch();
   }
   window.addEventListener("resize", resize);
+  // defer initial resize/fetch until layout is ready
+  requestAnimationFrame(()=>{ resize(); });
   resize();
 
   window.addEventListener("mousemove", (e)=>{
@@ -718,13 +974,12 @@
   }
 
   function floodFill(sx,sy, replacement){
-    const startKey=`${sx},${sy}`;
-    const startColor = pixels.get(startKey) || null;
+    const startColor = getPixel(sx,sy) || null;
     const normReplacement = replacement.toLowerCase();
     const startNorm = startColor ? startColor.toLowerCase() : null;
     if(startNorm === normReplacement) return [];
     const queue=[{x:sx,y:sy}];
-    const visited=new Set([startKey]);
+    const visited=new Set([`${sx},${sy}`]);
     const result=[];
     let head=0;
     let hitLimit=false;
@@ -734,8 +989,7 @@
         break;
       }
       const {x,y}=queue[head++];
-      const k=`${x},${y}`;
-      const cur = pixels.get(k) || null;
+      const cur = getPixel(x,y) || null;
       const curNorm = cur ? cur.toLowerCase() : null;
       if(curNorm !== startNorm) continue;
       result.push({x,y});
@@ -749,7 +1003,7 @@
         const nk=`${nx},${ny}`;
         if(visited.has(nk)) continue;
         visited.add(nk);
-        const ncur = pixels.get(nk) || null;
+        const ncur = getPixel(nx,ny) || null;
         const nNorm = ncur ? ncur.toLowerCase() : null;
         if(nNorm === startNorm){
           queue.push({x:nx,y:ny});
@@ -769,6 +1023,7 @@
     const h = canvas.height / dpr;
 
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.imageSmoothingEnabled = false;
     ctx.clearRect(0, 0, w, h);
     ctx.fillStyle = "#ffffff";
     ctx.fillRect(0, 0, w, h);
@@ -777,6 +1032,7 @@
     ctx.translate(w / 2, h / 2);
     ctx.scale(scale, scale);
     ctx.translate(-offsetX, -offsetY);
+    ctx.imageSmoothingEnabled = false;
 
     const vb = getViewportBounds();
     const minWorldX = vb.minWorldX, maxWorldX = vb.maxWorldX;
@@ -788,6 +1044,8 @@
     const maxGridY = Math.floor(maxWorldY / PIXEL_SIZE) + 1;
 
     const canDrawGrid = isGridVisible();
+    // 擬似グリッド対策: 隣接ピクセル間の隙間を埋めるためのオーバーラップ量（0.6画面px）
+    const pad = 0.6 / scale;
 
     if (canDrawGrid) {
       ctx.strokeStyle = "rgba(0,0,0,0.08)";
@@ -812,13 +1070,19 @@
       ctx.stroke();
     }
 
-    for (const [key, color] of pixels) {
-      const comma = key.indexOf(",");
-      const gx = parseInt(key.slice(0, comma), 10);
-      const gy = parseInt(key.slice(comma + 1), 10);
-      if (gx < minGridX || gx > maxGridX || gy < minGridY || gy > maxGridY) continue;
-      ctx.fillStyle = color;
-      ctx.fillRect(gx * PIXEL_SIZE, gy * PIXEL_SIZE, PIXEL_SIZE, PIXEL_SIZE);
+    // Viewport Culling (B) + A: no per-cell string key — iterate only rendered pixels in viewport tiles
+    const vpTiles = getTilesForViewport();
+    for(const tile of vpTiles){
+      const tmap = tilePixels.get(tile.key);
+      if(!tmap) continue;
+      for(const [k,color] of tmap){
+        const comma = k.indexOf(',');
+        const x = parseInt(k.slice(0, comma), 10);
+        const y = parseInt(k.slice(comma+1), 10);
+        if(x < minGridX || x > maxGridX || y < minGridY || y > maxGridY) continue;
+        ctx.fillStyle = color;
+        ctx.fillRect(x * PIXEL_SIZE, y * PIXEL_SIZE, PIXEL_SIZE + pad, PIXEL_SIZE + pad);
+      }
     }
 
     if(isDrawing && drawStartGrid && drawCurrentGrid){
@@ -843,7 +1107,7 @@
         }
         for(const p of pts){
           if(p.x < minGridX || p.x > maxGridX || p.y < minGridY || p.y > maxGridY) continue;
-          ctx.fillRect(p.x * PIXEL_SIZE, p.y * PIXEL_SIZE, PIXEL_SIZE, PIXEL_SIZE);
+          ctx.fillRect(p.x * PIXEL_SIZE, p.y * PIXEL_SIZE, PIXEL_SIZE + pad, PIXEL_SIZE + pad);
           if(!shapeFilled || isEraser){
             ctx.globalAlpha = isEraser ? 1 : 0.9;
             ctx.strokeStyle = isEraser ? "rgba(220,40,40,0.9)" : "rgba(0,0,0,0.15)";
@@ -887,8 +1151,7 @@
         if(!isToolAllowed(currentTool)) showGhost = false;
         if(showGhost){
           if(currentTool===TOOLS.SPoit){
-            const k=`${hoverGrid.x},${hoverGrid.y}`;
-            const pickedColor = pixels.get(k) || ERASER_COLOR;
+            const pickedColor = getPixel(hoverGrid.x,hoverGrid.y) || ERASER_COLOR;
             ctx.fillStyle = pickedColor;
             ctx.globalAlpha = 0.5;
             ctx.fillRect(hoverGrid.x * PIXEL_SIZE, hoverGrid.y * PIXEL_SIZE, PIXEL_SIZE, PIXEL_SIZE);
@@ -940,7 +1203,7 @@
     if (hoverGrid) coordEl.textContent = `${hoverGrid.x}, ${hoverGrid.y}`;
     else coordEl.textContent = `${Math.floor(offsetX/PIXEL_SIZE)}, ${Math.floor(offsetY/PIXEL_SIZE)}`;
     zoomEl.textContent = Math.round(scale * 100) + "%";
-    pixCountEl.textContent = pixels.size;
+    pixCountEl.textContent = pixelCount;
   }
 
   // ---- Draw ops (with local undo tracking) ----
@@ -951,7 +1214,7 @@
       const k=`${p.x},${p.y}`;
       if(seen.has(k)) continue;
       seen.add(k);
-      const prev = pixels.get(k) || null;
+      const prev = getPixel(p.x,p.y) || null;
       const prevNorm = prev ? prev.toLowerCase() : null;
       const newNorm = newColor.toLowerCase();
       if(prevNorm === newNorm) continue;
@@ -960,35 +1223,37 @@
     return arr;
   }
   function doDraw(gx, gy) {
-    const key = `${gx},${gy}`;
+    if(!canDraw()){ showDrawLimitWarn(); return; }
     const normalized = getCurrentColor().toLowerCase();
-    const prev = pixels.get(key) || null;
+    const prev = getPixel(gx,gy) || null;
     const prevNorm = prev ? prev.toLowerCase() : null;
     if(prevNorm === normalized) return;
+    recordDraw();
     pushUndo({pixels:[{x:gx, y:gy, prev: prev, newColor: normalized}]});
     if (normalized === ERASER_COLOR) {
-      pixels.delete(key);
+      deletePixel(gx,gy);
     } else {
-      pixels.set(key, normalized);
+      setPixel(gx,gy, normalized);
     }
-    render(); updateInfo();
+    scheduleRender(); updateInfo();
     if (socket && socket.connected) {
       socket.emit("draw", { x: gx, y: gy, color: normalized });
     }
   }
   function doDrawBatch(pixelList){
     if(!pixelList || pixelList.length===0) return;
+    if(!canDraw()){ showDrawLimitWarn(); return; }
     const normalized = getCurrentColor().toLowerCase();
     const undoPixels = capturePrevForBatch(pixelList, normalized);
     if(undoPixels.length===0) return;
+    recordDraw();
     pushUndo({pixels: undoPixels});
     const isEraser = normalized === ERASER_COLOR;
     for(const p of pixelList){
-      const k=`${p.x},${p.y}`;
-      if(isEraser) pixels.delete(k);
-      else pixels.set(k, normalized);
+      if(isEraser) deletePixel(p.x,p.y);
+      else setPixel(p.x,p.y, normalized);
     }
-    render(); updateInfo();
+    scheduleRender(); updateInfo();
     if(socket && socket.connected){
       if(pixelList.length===1){
         socket.emit("draw", {x:pixelList[0].x, y:pixelList[0].y, color: normalized});
@@ -1002,28 +1267,27 @@
     const normalized = selectedColor.toLowerCase();
     const isEraser = normalized === ERASER_COLOR;
     for(const p of pixelList){
-      const k=`${p.x},${p.y}`;
-      if(isEraser) pixels.delete(k);
-      else pixels.set(k, normalized);
+      if(isEraser) deletePixel(p.x,p.y);
+      else setPixel(p.x,p.y, normalized);
     }
-    render(); updateInfo();
+    scheduleRender(); updateInfo();
     if(socket && socket.connected){
       socket.emit("drawBatch", pixelList.map(p=>({x:p.x,y:p.y,color:normalized})));
     }
   }
   function doErase(gx, gy) {
-    const key = `${gx},${gy}`;
-    const prev = pixels.get(key) || null;
+    const prev = getPixel(gx,gy) || null;
     if(prev === null) return;
     pushUndo({pixels:[{x:gx, y:gy, prev: prev, newColor: ERASER_COLOR}]});
-    pixels.delete(key);
-    render(); updateInfo();
+    deletePixel(gx,gy);
+    scheduleRender(); updateInfo();
     if (socket && socket.connected) {
       socket.emit("draw", { x: gx, y: gy, color: ERASER_COLOR });
     }
   }
   function doFill(gx, gy){
     if(!isToolAllowed(TOOLS.FILL)) { showGridWarn(); return; }
+    if(!canDraw()){ showDrawLimitWarn(); return; }
     const replacement = getCurrentColor();
     const result = floodFill(gx, gy, replacement);
     if(result === null){
@@ -1051,21 +1315,21 @@
       redo();
       return;
     }
-    if(e.key==="Shift") { shiftDown=true; if(isDrawing && (currentTool===TOOLS.CIRCLE || currentTool===TOOLS.LINE)) { render(); updateToolUI(); } }
+    if(e.key==="Shift") { shiftDown=true; if(isDrawing && (currentTool===TOOLS.CIRCLE || currentTool===TOOLS.LINE)) { scheduleRender(); updateToolUI(); } }
     if(e.key.toLowerCase()==="s" && !e.ctrlKey && !e.metaKey && !e.altKey){
       e.preventDefault();
       selectTool(TOOLS.SPoit);
     }
     if (e.key === "+" || e.key === "=") {
       scale = Math.min(MAX_SCALE, scale * 1.2);
-      render(); updateInfo(); updateToolUI();
+      scheduleRender(); updateInfo(); updateToolUI();
     } else if (e.key === "-" || e.key === "_") {
       scale = Math.max(MIN_SCALE, scale / 1.2);
-      render(); updateInfo(); updateToolUI();
+      scheduleRender(); updateInfo(); updateToolUI();
     }
   });
   window.addEventListener("keyup", (e)=>{
-    if(e.key==="Shift") { shiftDown=false; if(isDrawing && (currentTool===TOOLS.CIRCLE || currentTool===TOOLS.LINE)) { render(); updateToolUI(); } }
+    if(e.key==="Shift") { shiftDown=false; if(isDrawing && (currentTool===TOOLS.CIRCLE || currentTool===TOOLS.LINE)) { scheduleRender(); updateToolUI(); } }
   });
 
   // Mouse
@@ -1075,6 +1339,7 @@
       panStartScreen = { x: e.clientX, y: e.clientY };
       panStartOffset = { x: offsetX, y: offsetY };
       canvas.classList.add("grabbing");
+      triggerViewportFetchImmediate();
       e.preventDefault();
       return;
     }
@@ -1086,8 +1351,7 @@
      activeButton = e.button;
 
      if(currentTool === TOOLS.SPoit){
-       const k=`${grid.x},${grid.y}`;
-       const col = pixels.get(k) || ERASER_COLOR;
+       const col = getPixel(grid.x,grid.y) || ERASER_COLOR;
        selectColor(col);
        const prev = spoitPrevTool || TOOLS.DOT;
        isEraserStroke = false;
@@ -1115,26 +1379,26 @@
       return;
     }
     if(currentTool===TOOLS.PEN){
+      if(!canDraw()){ showDrawLimitWarn(); isEraserStroke=false; activeButton=null; return; }
       isDrawing = true;
       penLastGrid = grid;
       penStrokeMap = new Map();
-      const k=`${grid.x},${grid.y}`;
-      const prev = pixels.get(k) || null;
+      const prev = getPixel(grid.x,grid.y) || null;
       const normalized = getCurrentColor().toLowerCase();
       const prevNorm = prev ? prev.toLowerCase() : null;
       if(prevNorm !== normalized){
-        penStrokeMap.set(k, {x:grid.x, y:grid.y, prev: prev, newColor: normalized});
+        penStrokeMap.set(`${grid.x},${grid.y}`, {x:grid.x, y:grid.y, prev: prev, newColor: normalized});
       }
-      if(normalized === ERASER_COLOR) pixels.delete(k);
-      else pixels.set(k, normalized);
-      render(); updateInfo();
+      if(normalized === ERASER_COLOR) deletePixel(grid.x,grid.y);
+      else setPixel(grid.x,grid.y, normalized);
+      scheduleRender(); updateInfo();
       if(socket && socket.connected) socket.emit("draw", {x:grid.x, y:grid.y, color: normalized});
       canvas.setPointerCapture && canvas.setPointerCapture(e.pointerId);
     } else if(currentTool===TOOLS.RECT || currentTool===TOOLS.CIRCLE || currentTool===TOOLS.LINE){
       isDrawing = true;
       drawStartGrid = grid;
       drawCurrentGrid = grid;
-      render();
+      scheduleRender();
     }
   });
 
@@ -1150,7 +1414,8 @@
       if(Math.hypot(dx,dy) > DOT_DRAG_THRESHOLD) dotHasMoved = true;
       offsetX = dotPanStartOffset.x - dx / scale;
       offsetY = dotPanStartOffset.y - dy / scale;
-      render(); updateInfo();
+      scheduleRender(); updateInfo();
+      scheduleViewportFetchThrottled();
       return;
     }
 
@@ -1159,7 +1424,8 @@
       const dy = e.clientY - panStartScreen.y;
       offsetX = panStartOffset.x - dx / scale;
       offsetY = panStartOffset.y - dy / scale;
-      render(); updateInfo();
+      scheduleRender(); updateInfo();
+      scheduleViewportFetchThrottled();
       return;
     }
 
@@ -1182,7 +1448,7 @@
           for(const p of toDraw){
             const k=`${p.x},${p.y}`;
             if(!penStrokeMap.has(k)){
-              const prev = pixels.get(k) || null;
+              const prev = getPixel(p.x,p.y) || null;
               const prevNorm = prev ? prev.toLowerCase() : null;
               if(prevNorm !== normalized){
                 penStrokeMap.set(k, {x:p.x, y:p.y, prev: prev, newColor: normalized});
@@ -1190,10 +1456,9 @@
             }
           }
           for(const p of toDraw){
-            const k=`${p.x},${p.y}`;
-            if(isEraser) pixels.delete(k); else pixels.set(k, normalized);
+              if(isEraser) deletePixel(p.x,p.y); else setPixel(p.x,p.y, normalized);
           }
-          render(); updateInfo();
+          scheduleRender(); updateInfo();
           if(socket && socket.connected){
             socket.emit("drawBatch", toDraw.map(p=>({x:p.x,y:p.y,color:normalized})));
           }
@@ -1201,18 +1466,19 @@
         }
       } else if((currentTool===TOOLS.RECT || currentTool===TOOLS.CIRCLE || currentTool===TOOLS.LINE) && drawStartGrid){
         drawCurrentGrid = grid;
-        render(); updateInfo();
+        scheduleRender(); updateInfo();
       }
       return;
     }
 
-    render(); updateInfo();
+    scheduleRender(); updateInfo();
   });
 
   canvas.addEventListener("mouseup", (e) => {
     if(e.button===1 && isPanning){
       isPanning=false;
       canvas.classList.remove("grabbing");
+      scheduleViewportFetch();
       return;
     }
     if(isDotPanning && (e.button===0 || e.button===2) && e.button===activeButton){
@@ -1224,7 +1490,8 @@
         const grid=worldToGrid(world.x, world.y);
         doDraw(grid.x, grid.y);
       } else {
-        render();
+        scheduleRender();
+        scheduleViewportFetch();
       }
       isEraserStroke=false; activeButton=null;
       return;
@@ -1238,10 +1505,11 @@
         isDrawing=false;
         penLastGrid=null;
         if(penStrokeMap && penStrokeMap.size>0){
+          recordDraw();
           pushUndo({pixels: Array.from(penStrokeMap.values())});
         }
         penStrokeMap=null;
-        render(); updateUndoUI();
+        scheduleRender(); updateUndoUI();
       } else if(currentTool===TOOLS.RECT || currentTool===TOOLS.CIRCLE || currentTool===TOOLS.LINE){
         isDrawing=false;
         if(drawStartGrid && drawCurrentGrid){
@@ -1259,7 +1527,7 @@
         }
         drawStartGrid=null;
         drawCurrentGrid=null;
-        render();
+        scheduleRender();
       }
       isEraserStroke=false;
       activeButton=null;
@@ -1283,7 +1551,8 @@
     isDrawing = false;
     hoverGrid = null;
     canvas.classList.remove("grabbing");
-    render();
+    scheduleRender();
+    if(initialLoaded) scheduleViewportFetch();
   });
 
   canvas.addEventListener("wheel", (e) => {
@@ -1298,7 +1567,7 @@
       const after = screenToWorld(e.clientX, e.clientY);
       offsetX += before.x - after.x;
       offsetY += before.y - after.y;
-      render(); updateInfo(); updateToolUI();
+      scheduleRender(); updateInfo(); updateToolUI();
       return;
     }
     const absX = Math.abs(e.deltaX);
@@ -1309,7 +1578,8 @@
     }
     offsetX += e.deltaX / scale;
     offsetY += e.deltaY / scale;
-    render(); updateInfo();
+    scheduleRender(); updateInfo();
+    scheduleViewportFetchThrottled();
   }, { passive: false });
 
   canvas.addEventListener("touchstart", (e) => {
@@ -1328,8 +1598,7 @@
         dotPanStartOffset = { x: offsetX, y: offsetY };
         touchMode='dotPan';
       } else if(currentTool===TOOLS.SPoit){
-        const k=`${grid.x},${grid.y}`;
-        const col = pixels.get(k) || ERASER_COLOR;
+        const col = getPixel(grid.x,grid.y) || ERASER_COLOR;
         selectColor(col);
         const prev = spoitPrevTool || TOOLS.DOT;
         selectTool(prev);
@@ -1341,22 +1610,23 @@
         doFill(grid.x, grid.y);
         touchMode=null;
       } else if(currentTool===TOOLS.PEN){
+        if(!canDraw()){ showDrawLimitWarn(); touchMode=null; return; }
         isDrawing=true;
         penLastGrid=grid;
         penStrokeMap = new Map();
         const k=`${grid.x},${grid.y}`;
-        const prev = pixels.get(k) || null;
+        const prev = getPixel(p.x,p.y) || null;
         const normalized = selectedColor.toLowerCase();
         const prevNorm = prev ? prev.toLowerCase() : null;
         if(prevNorm !== normalized) penStrokeMap.set(k, {x:grid.x, y:grid.y, prev: prev, newColor: normalized});
-        if(normalized === ERASER_COLOR) pixels.delete(k); else pixels.set(k, normalized);
-        render(); updateInfo();
+        if(normalized === ERASER_COLOR) deletePixel(p.x,p.y); else setPixel(p.x,p.y, normalized);
+        scheduleRender(); updateInfo();
         if(socket && socket.connected) socket.emit("draw", {x:grid.x, y:grid.y, color: normalized});
       } else if(currentTool===TOOLS.RECT || currentTool===TOOLS.CIRCLE || currentTool===TOOLS.LINE){
         isDrawing=true;
         drawStartGrid=grid;
         drawCurrentGrid=grid;
-        render();
+        scheduleRender();
       }
     } else if(e.touches.length===2){
       if(isDotPanning){
@@ -1365,14 +1635,15 @@
       }
       if(isDrawing){
         if(currentTool===TOOLS.PEN && penStrokeMap && penStrokeMap.size>0){
-          pushUndo({pixels: Array.from(penStrokeMap.values())});
+          cancelPenStroke();
           penStrokeMap=null;
+          penLastGrid=null;
         }
         isDrawing=false;
         drawStartGrid=null;
         drawCurrentGrid=null;
         penLastGrid=null;
-        render();
+        scheduleRender();
       }
       touchMode='panzoom';
       wasPinch=true;
@@ -1394,7 +1665,7 @@
       if(Math.hypot(dx,dy) > DOT_DRAG_THRESHOLD) dotHasMoved=true;
       offsetX = dotPanStartOffset.x - dx / scale;
       offsetY = dotPanStartOffset.y - dy / scale;
-      render(); updateInfo();
+      scheduleRender(); updateInfo();
       return;
     }
     if(e.touches.length===1 && touchMode==='draw'){
@@ -1413,24 +1684,23 @@
             for(const p of line) toDraw.push(p);
             if(!penStrokeMap) penStrokeMap = new Map();
             for(const p of toDraw){
-              const k=`${p.x},${p.y}`;
-              if(!penStrokeMap.has(k)){
-                const prev = pixels.get(k) || null;
+            const k=`${p.x},${p.y}`;
+            if(!penStrokeMap.has(k)){
+              const prev = getPixel(p.x,p.y) || null;
                 const prevNorm = prev ? prev.toLowerCase() : null;
                 if(prevNorm !== normalized) penStrokeMap.set(k, {x:p.x, y:p.y, prev: prev, newColor: normalized});
               }
             }
             for(const p of toDraw){
-              const k=`${p.x},${p.y}`;
-              if(isEraser) pixels.delete(k); else pixels.set(k, normalized);
+              if(isEraser) deletePixel(p.x,p.y); else setPixel(p.x,p.y, normalized);
             }
-            render(); updateInfo();
+            scheduleRender(); updateInfo();
             if(socket && socket.connected) socket.emit("drawBatch", toDraw.map(p=>({x:p.x,y:p.y,color:normalized})));
             penLastGrid=grid;
           }
         } else if((currentTool===TOOLS.RECT || currentTool===TOOLS.CIRCLE || currentTool===TOOLS.LINE) && drawStartGrid){
           drawCurrentGrid=grid;
-          render(); updateInfo();
+          scheduleRender(); updateInfo();
         }
       }
     } else if(e.touches.length===2){
@@ -1460,7 +1730,8 @@
       }
       lastTouchDist=dist;
       lastTouchCenter={x:cx,y:cy};
-      render(); updateInfo(); updateToolUI();
+      scheduleRender(); updateInfo(); updateToolUI();
+      scheduleViewportFetchThrottled();
     }
   }, { passive: false });
 
@@ -1478,7 +1749,7 @@
           const grid=worldToGrid(world.x, world.y);
           doDraw(grid.x, grid.y);
         } else {
-          render();
+          scheduleRender();
         }
         wasPinch=false;
         dotHasMoved=false;
@@ -1490,7 +1761,7 @@
         touchMode=null;
         lastTouchDist=null;
         lastTouchCenter=null;
-        render();
+        scheduleRender();
         return;
       }
       if(isDrawing){
@@ -1498,10 +1769,11 @@
           isDrawing=false;
           penLastGrid=null;
           if(penStrokeMap && penStrokeMap.size>0){
+            recordDraw();
             pushUndo({pixels: Array.from(penStrokeMap.values())});
           }
           penStrokeMap=null;
-          render(); updateUndoUI();
+          scheduleRender(); updateUndoUI();
         } else if(currentTool===TOOLS.RECT || currentTool===TOOLS.CIRCLE || currentTool===TOOLS.LINE){
           isDrawing=false;
           if(drawStartGrid && drawCurrentGrid){
@@ -1518,7 +1790,7 @@
             }
           }
           drawStartGrid=null; drawCurrentGrid=null;
-          render();
+          scheduleRender();
         }
       }
       touchMode=null;
@@ -1537,6 +1809,7 @@
 
   canvas.addEventListener("touchcancel", (e) => {
     if(penStrokeMap && penStrokeMap.size>0){
+      cancelPenStroke();
       penStrokeMap=null;
       penLastGrid=null;
     }
@@ -1547,53 +1820,78 @@
     touchMode=null;
     lastTouchDist=null;
     lastTouchCenter=null;
-    render();
+    scheduleRender();
   });
 
   // ---- Socket.io ----
   const socket = io();
 
+  // Long-load UX: update loading text after 3s if still loading
+  setTimeout(()=>{
+    if(!initialLoaded && loadingTextEl){
+      loadingTextEl.textContent = "サーバー起動中...";
+      if(loadingSubEl) loadingSubEl.textContent = "Freeプランのため初回起動に30秒ほどかかる場合があります。しばらくお待ちください。";
+    }
+  }, 3000);
+  setTimeout(()=>{
+    if(!initialLoaded){
+      showLoading("読み込みに時間がかかっています", "ネットワークを確認するか、ページを再読み込みしてください。");
+    }
+  }, 15000);
+
   socket.on("connect", () => {
     statusEl.className = "online";
     connTextEl.textContent = "オンライン";
+    if(!initialLoaded) fetchViewport(true);
   });
   socket.on("disconnect", () => {
     statusEl.className = "offline";
     connTextEl.textContent = "切断";
   });
+  socket.on("ready", (info) => {
+    if(info && typeof info.pixels==="number") pixCountEl.textContent = info.pixels;
+    if(!initialLoaded) fetchViewport(true);
+  });
   socket.on("init", (data) => {
-    pixels.clear();
-    for (const [k, v] of Object.entries(data)) pixels.set(k, v);
-    undoStack=[]; redoStack=[]; updateUndoUI();
-    render(); updateInfo();
+    // legacy full init (320k would be heavy) — keep for ?legacy=1
+    if(data && typeof data === "object" && Object.keys(data).length>0){
+      for (const [k, v] of Object.entries(data)) { const [px,py]=k.split(',').map(Number); setPixel(px,py, v); }
+      undoStack=[]; redoStack=[]; updateUndoUI();
+      initialLoaded = true;
+      hideLoading();
+      scheduleRender(); updateInfo();
+    }
   });
   socket.on("draw", ({ x, y, color }) => {
     const normalized = color.toLowerCase();
     if (normalized === ERASER_COLOR) {
-      pixels.delete(`${x},${y}`);
+      deletePixel(x,y);
     } else {
-      pixels.set(`${x},${y}`, normalized);
+      setPixel(x,y, normalized);
     }
-    render(); updateInfo();
+    scheduleRender(); updateInfo();
   });
   socket.on("drawBatch", (arr) => {
     if(!Array.isArray(arr)) return;
     for(const {x,y,color} of arr){
       const normalized = (color||'').toLowerCase();
       if(!Number.isInteger(x) || !Number.isInteger(y)) continue;
-      if(normalized === ERASER_COLOR) pixels.delete(`${x},${y}`);
-      else pixels.set(`${x},${y}`, normalized);
+      if(normalized === ERASER_COLOR) deletePixel(x,y);
+      else setPixel(x,y, normalized);
     }
-    render(); updateInfo();
+    scheduleRender(); updateInfo();
   });
   socket.on("userCount", (n) => {
     userCountEl.textContent = `(${n}人接続中)`;
   });
 
-  // initial render
-  render(); updateInfo(); updateToolUI();
+  // initial render + viewport fetch (HTTP, no socket wait)
+  scheduleRender(); updateInfo(); updateToolUI();
+  // Fetch viewport immediately via HTTP (does not wait for socket)
+  fetchViewport(true);
+  // Also poll ready if socket already connected
+  if(window.fetch) setTimeout(()=>{ if(!initialLoaded) fetchViewport(true); }, 800);
 })();
 </script>
 </body>
 </html>
-```[cite: 4]

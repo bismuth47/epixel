@@ -1,7 +1,7 @@
 {
-  "name": "everyone-draw",
+  "name": "epixel",
   "version": "1.0.0",
-  "description": "Everyone Draw clone - infinite collaborative pixel canvas",
+  "description": "epixel - infinite collaborative pixel canvas",
   "type": "commonjs",
   "main": "server.js",
   "scripts": {
@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.112.4",
+    "compression": "^1.8.1",
     "express": "^4.19.2",
     "socket.io": "^4.7.5"
   }
