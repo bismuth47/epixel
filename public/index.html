@@ -126,7 +126,8 @@
   <div id="paletteWrap"></div>
 </div>
 
-<script src="/socket.io/socket.io.js"></script>
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="/shared/chunk-codec.js"></script>
 <script>
 (function() {
   const canvas = document.getElementById("canvas");
@@ -302,8 +303,8 @@
   // viewport fetch state (tile-based)
   let initialLoaded = false;
   let fetchTimer = null;
-  const TILE = 100; // 100x100 per request (fits server limits)
-  const MAX_TILES_PER_FETCH = 25; // 25*10k=250k cells max
+  const TILE = ChunkCodec.CHUNK_SIZE; // 256x256 per request (matches server chunk size)
+  const MAX_TILES_PER_FETCH = 25; // 25*65536=1.6M cells max
   const fetchedTiles = new Set(); // "tx,ty"
   const fetchingTiles = new Set();
   let fetchingCount = 0;
@@ -700,30 +701,39 @@
     fetchingTiles.add(key);
     fetchingCount++;
     try{
-      const url = `/api/pixels?x0=${tile.x0}&y0=${tile.y0}&x1=${tile.x1}&y1=${tile.y1}`;
+      const cx = tile.tx;
+      const cy = tile.ty;
+      const url = `/api/chunks?cx=${cx}&cy=${cy}`;
       const res = await fetch(url);
+      if(res.status === 404){
+        // No chunk for this tile — empty, mark as fetched
+        fetchedTiles.add(key);
+        return 0;
+      }
       if(!res.ok){
         const txt = await res.text();
         console.warn("[fetchTile] failed", key, res.status, txt);
         return 0;
       }
-      const j = await res.json();
-      const arr = j.pixels || [];
-      // chunked insert to avoid blocking pan (40k set in one frame janks)
+      const buf = await res.arrayBuffer();
+      const binary = new Uint8Array(buf);
+      const pixels = ChunkCodec.decode(binary);
+      // chunked insert to avoid blocking pan (65k pixels max per chunk)
       const CHUNK = 2500;
-      for(let i=0;i<arr.length;i+=CHUNK){
-        const slice = arr.slice(i, i+CHUNK);
-        for(const {x,y,color} of slice){
-          const hex = fromWireColor(color);
-          if(hex) setPixel(x,y, hex);
+      for(let i=0;i<pixels.length;i+=CHUNK){
+        const slice = pixels.slice(i, i+CHUNK);
+        for(const p of slice){
+          const gx = cx * TILE + p.x;
+          const gy = cy * TILE + p.y;
+          setPixel(gx, gy, CODE_TO_COLOR[p.colorId]);
         }
-        if(arr.length > CHUNK && i+CHUNK < arr.length){
+        if(pixels.length > CHUNK && i+CHUNK < pixels.length){
           // yield to render between chunks
           await new Promise(r=> requestAnimationFrame(()=> r()));
         }
       }
       fetchedTiles.add(key);
-      return arr.length;
+      return pixels.length;
     }catch(e){
       console.warn("[fetchTile] error", key, e.message);
       return 0;

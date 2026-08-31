@@ -14,5 +14,9 @@ services:
         fromSecret: SUPABASE_URL
       - key: SUPABASE_ANON_KEY
         fromSecret: SUPABASE_ANON_KEY
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        fromSecret: SUPABASE_SERVICE_ROLE_KEY
+      - key: SUPABASE_DB_PASSWORD
+        fromSecret: SUPABASE_DB_PASSWORD
       - key: PORT
         value: 10000

@@ -5,6 +5,8 @@ const path = require("path");
 const fs = require("fs");
 const compression = require("compression");
 const { createClient } = require("@supabase/supabase-js");
+const { Pool } = require("pg");
+const ChunkCodec = require("./shared/chunk-codec");
 
 const PORT = process.env.PORT || 3000;
 const DATA_FILE = path.join(__dirname, "canvas.json");
@@ -13,7 +15,29 @@ const SAVE_INTERVAL_MS = 2000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SUPABASE_DB_PASSWORD = process.env.SUPABASE_DB_PASSWORD;
 const SUPABASE_TABLE = process.env.SUPABASE_TABLE || "canvas_pixels";
+const CHUNK_TABLE = "canvas_chunks";
+const CHUNK_SIZE = ChunkCodec.CHUNK_SIZE;
+
+// Direct PostgreSQL pool (fallback when Supabase REST API key is invalid)
+let pgPool = null;
+if (SUPABASE_URL && SUPABASE_DB_PASSWORD) {
+  const urlMatch = SUPABASE_URL.match(/https:\/\/([^.]+)\.supabase\.co/);
+  if (urlMatch) {
+    const projectRef = urlMatch[1];
+    pgPool = new Pool({
+      host: `aws-0-ap-northeast-1.pooler.supabase.com`,
+      port: 6543,
+      database: "postgres",
+      user: `postgres.${projectRef}`,
+      password: SUPABASE_DB_PASSWORD,
+      ssl: { rejectUnauthorized: false },
+      connectionTimeoutMillis: 10000,
+      query_timeout: 30000,
+    });
+  }
+}
 
 // ── Color code mapping (0–26 = 27 drawable colors, white/eraser is special) ──
 const CODE_TO_COLOR = [
@@ -68,12 +92,18 @@ const io = new Server(server, {
 
 // Supabase client (prefer service_role key; fall back to anon)
 let supabase = null;
+let usePgFallback = false;
 const SUPABASE_KEY = SUPABASE_SERVICE_ROLE_KEY || SUPABASE_ANON_KEY;
 if (SUPABASE_URL && SUPABASE_KEY) {
   supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
   console.log(`[supabase] client initialized (${SUPABASE_SERVICE_ROLE_KEY ? 'service_role' : 'anon'})`);
+} else if (pgPool) {
+  console.log("[supabase] JS client not configured, using pg pool connection");
 } else {
   console.log("[supabase] not configured, using file-based storage");
+}
+if (pgPool) {
+  console.log("[supabase] pg pool available as fallback");
 }
 
 // ---- Canvas Data (infinite, sparse) ----
@@ -81,150 +111,147 @@ const canvasData = new Map();
 let dirty = false;
 let ready = false;
 let loadError = null;
-let dbAcceptsCodes = true; // optimistic: assume INTEGER column; falls back to hex storage if CHECK rejects codes
 // Incremental save state for Supabase (avoid full 66k delete+upsert that blocks event loop)
 let isSaving = false;
 const pendingUpserts = new Map(); // "x,y" -> color
 const pendingDeletes = new Set(); // "x,y"
 
-async function loadFromSupabase() {
-  console.log("[load] loading from Supabase...");
-  const { data, error } = await supabase
-    .from(SUPABASE_TABLE)
-    .select("x,y,color");
-
-  if (error) {
-    console.error("[load] Supabase error:", error.message);
-    return;
+// Helper: convert hex string, Buffer, or Uint8Array from PostgREST BYTEA to Uint8Array
+function bufferToUint8Array(data) {
+  if (!data) return new Uint8Array(0);
+  if (typeof data === "string") {
+    if (data.startsWith("\\x")) {
+      return Uint8Array.from(Buffer.from(data.slice(2), "hex"));
+    }
+    return Uint8Array.from(Buffer.from(data, "hex"));
   }
-
-  let removed = 0;
-  for (const row of data) {
-    const { x, y, color } = row;
-    const code = normalizeColor(color);
-    if (code === undefined) { removed++; continue; }
-    if (code === ERASER_CODE) { removed++; continue; } // eraser never stored
-    canvasData.set(`${x},${y}`, code);
+  if (Buffer.isBuffer(data)) {
+    return new Uint8Array(data);
   }
-  console.log(`[load] ${canvasData.size} pixels loaded from Supabase${removed ? `, ${removed} removed` : ""}`);
+  if (data instanceof Uint8Array) {
+    return data;
+  }
+  return new Uint8Array(data);
 }
 
-async function saveToSupabase() {
-  if (!supabase) return false;
-  if (isSaving) return true;
-  if (pendingUpserts.size === 0 && pendingDeletes.size === 0) return true;
+// Helper: convert Uint8Array to \\x hex string for PostgREST BYTEA insert
+function bufferToHex(buf) {
+  return "\\x" + Buffer.from(buf).toString("hex");
+}
 
-  isSaving = true;
-  // snapshot and clear to allow new draws during save
-  const upserts = new Map(pendingUpserts);
-  const deletes = new Set(pendingDeletes);
-  pendingUpserts.clear();
-  pendingDeletes.clear();
-
-  const totalOps = upserts.size + deletes.size;
-  console.log(`[save] saving ${totalOps} ops (upserts=${upserts.size} deletes=${deletes.size}) totalPixels=${canvasData.size}...`);
-  try {
-    // Deletes first (batched, parallel 50 at a time to avoid blocking)
-    if (deletes.size > 0) {
-      const delKeys = Array.from(deletes);
-      for (let i = 0; i < delKeys.length; i += 100) {
-        const batch = delKeys.slice(i, i + 100);
-        const results = await Promise.all(batch.map(k => {
-          const [x, y] = k.split(",").map(Number);
-          return supabase.from(SUPABASE_TABLE).delete().eq("x", x).eq("y", y);
-        }));
-        for (const r of results) {
-          if (r.error) console.error("[save] delete error:", r.error.message);
-        }
-      }
-    }
-    // Upserts in 1000 batches (Supabase limit)
-    if (upserts.size > 0) {
-      const payload = Array.from(upserts, ([k, color]) => {
-        const [x, y] = k.split(",").map(Number);
-        if (dbAcceptsCodes) {
-          return { x, y, color }; // numeric code (0–26)
-        }
-        const hex = CODE_TO_COLOR[color];
-        return { x, y, color: hex !== undefined ? hex : CODE_TO_COLOR[0] };
-      });
-      for (let i = 0; i < payload.length; i += 1000) {
-        const batch = payload.slice(i, i + 1000);
-        const { error } = await supabase
-          .from(SUPABASE_TABLE)
-          .upsert(batch, { onConflict: ["x", "y"] });
-        if (error) {
-          // If DB still has TEXT column with hex CHECK, fall back to storing hex strings
-          if (dbAcceptsCodes && error.message.includes("check constraint") && error.message.includes("color")) {
-            console.log("[save] DB column does not accept numeric codes — switching to hex storage");
-            dbAcceptsCodes = false;
-            const hexBatch = batch.map(p => {
-              const hex = CODE_TO_COLOR[p.color];
-              return { x: p.x, y: p.y, color: hex !== undefined ? hex : CODE_TO_COLOR[0] };
-            });
-            const { error: retryError } = await supabase
-              .from(SUPABASE_TABLE)
-              .upsert(hexBatch, { onConflict: ["x", "y"] });
-            if (retryError) {
-              console.error("[save] hex fallback also failed:", retryError.message);
-              for (const p of batch) pendingUpserts.set(`${p.x},${p.y}`, p.color);
-              isSaving = false;
-              return false;
-            }
-            continue;
-          }
-          console.error("[save] Supabase upsert error:", error.message);
-          // re-queue failed batch
-          for (const p of batch) pendingUpserts.set(`${p.x},${p.y}`, p.color);
-          isSaving = false;
-          return false;
-        }
-      }
-    }
-    console.log(`[save] ${totalOps} ops saved, remaining pending=${pendingUpserts.size + pendingDeletes.size}`);
-    isSaving = false;
-    return true;
-  } catch (e) {
-    console.error("[save] Supabase error:", e.message);
-    // re-queue on exception
-    for (const [k, v] of upserts) pendingUpserts.set(k, v);
-    for (const k of deletes) pendingDeletes.add(k);
-    isSaving = false;
-    return false;
-  }
+// Helper: convert base64 string from Supabase JS client back to Uint8Array
+function base64ToUint8Array(b64) {
+  if (!b64) return new Uint8Array(0);
+  return new Uint8Array(Buffer.from(b64, "base64"));
 }
 
 async function loadFromSupabaseBatch() {
-  console.log("[load] loading from Supabase (batched)...");
-  let from = 0;
-  const batchSize = 1000;
-  while (true) {
-    const { data, error } = await supabase
-      .from(SUPABASE_TABLE)
-      .select("x,y,color")
-      .order("x", { ascending: true })
-      .order("y", { ascending: true })
-      .range(from, from + batchSize - 1);
-    if (error) {
-      console.error("[load] Supabase error:", error.message);
-      loadError = error.message;
-      break;
+  console.log("[load] loading from Supabase (chunks + legacy pixels)...");
+  let chunksLoaded = 0;
+
+  // ── 1. Load from canvas_chunks (primary storage) ──────────────
+  try {
+    let from = 0;
+    const batchSize = 1000;
+    while (true) {
+       let data, error;
+      if (supabase && !usePgFallback) {
+        const result = await supabase
+          .from(CHUNK_TABLE)
+          .select("chunk_x,chunk_y,data")
+          .order("chunk_x", { ascending: true })
+          .order("chunk_y", { ascending: true })
+          .range(from, from + batchSize - 1);
+        data = result.data;
+        error = result.error;
+        // Detect auth failure and switch to pgPool fallback
+        if (error && error.message.includes("Invalid API key") && pgPool) {
+          console.log("[load] Supabase REST API auth failed, switching to pg pool fallback");
+          usePgFallback = true;
+          continue;
+        }
+      } else if (pgPool) {
+        const result = await pgPool.query(
+          `SELECT chunk_x, chunk_y, data FROM ${CHUNK_TABLE} ORDER BY chunk_x ASC, chunk_y ASC LIMIT $1 OFFSET $2`,
+          [batchSize, from]
+        );
+        data = result.rows;
+        error = null;
+      } else {
+        break;
+      }
+      if (error) {
+        console.error("[load] canvas_chunks error:", error.message);
+        break;
+      }
+      if (!data || data.length === 0) break;
+      for (const chunk of data) {
+        const binary = bufferToUint8Array(chunk.data);
+        const pixels = ChunkCodec.decode(binary);
+        for (const p of pixels) {
+          const gx = chunk.chunk_x * CHUNK_SIZE + p.x;
+          const gy = chunk.chunk_y * CHUNK_SIZE + p.y;
+          canvasData.set(`${gx},${gy}`, p.colorId);
+        }
+        chunksLoaded++;
+      }
+      from += batchSize;
+      if (data.length < batchSize) break;
     }
-    if (!data || data.length === 0) break;
-    for (const row of data) {
-      const { x, y, color } = row;
-      const code = normalizeColor(color);
-      if (code === undefined || code === ERASER_CODE) continue;
-      canvasData.set(`${x},${y}`, code);
-    }
-    from += batchSize;
-    if (data.length < batchSize) break;
+  } catch (e) {
+    console.error("[load] canvas_chunks failed:", e.message);
   }
-  console.log(`[load] ${canvasData.size} pixels loaded from Supabase`);
+
+  // ── 2. Load from canvas_pixels (legacy/transition) ─────────────
+  // This captures any pixels drawn since the last chunk migration.
+  // Newer data overrides older data in the Map.
+  try {
+    let from = 0;
+    const batchSize = 1000;
+    while (true) {
+      let data, error;
+      if (supabase && !usePgFallback) {
+        const result = await supabase
+          .from(SUPABASE_TABLE)
+          .select("x,y,color")
+          .order("x", { ascending: true })
+          .order("y", { ascending: true })
+          .range(from, from + batchSize - 1);
+        data = result.data;
+        error = result.error;
+      } else if (pgPool) {
+        const result = await pgPool.query(
+          `SELECT x, y, color FROM ${SUPABASE_TABLE} ORDER BY x ASC, y ASC LIMIT $1 OFFSET $2`,
+          [batchSize, from]
+        );
+        data = result.rows;
+        error = null;
+      } else {
+        break;
+      }
+      if (error) {
+        console.error("[load] canvas_pixels error:", error.message);
+        break;
+      }
+      if (!data || data.length === 0) break;
+      for (const row of data) {
+        const { x, y, color } = row;
+        const code = normalizeColor(color);
+        if (code === undefined || code === ERASER_CODE) continue;
+        canvasData.set(`${x},${y}`, code);
+      }
+      from += batchSize;
+      if (data.length < batchSize) break;
+    }
+  } catch (e) {
+    console.error("[load] canvas_pixels legacy load failed:", e.message);
+  }
+
+  console.log(`[load] ${canvasData.size} pixels loaded from Supabase (${chunksLoaded} chunks + legacy pixels)`);
 }
 
 async function loadCanvas() {
-  if (supabase) {
+  if (supabase || pgPool) {
     try {
       await loadFromSupabaseBatch();
       ready = true;
@@ -241,14 +268,14 @@ async function loadCanvas() {
         const raw = fs.readFileSync(DATA_FILE, "utf-8");
         const obj = JSON.parse(raw);
         let removed = 0;
-         for (const [k, v] of Object.entries(obj)) {
-           const code = typeof v === "number" ? v : hexToCode(v);
-           if (code === undefined || code === ERASER_CODE || !VALID_CODES.has(code)) {
-             removed++;
-             continue;
-           }
-           canvasData.set(k, code);
-         }
+        for (const [k, v] of Object.entries(obj)) {
+          const code = typeof v === "number" ? v : hexToCode(v);
+          if (code === undefined || code === ERASER_CODE || !VALID_CODES.has(code)) {
+            removed++;
+            continue;
+          }
+          canvasData.set(k, code);
+        }
         console.log(`[load] ${canvasData.size} pixels loaded from ${DATA_FILE}${removed ? `, ${removed} removed (old palette)` : ""}`);
         if (removed > 0) { dirty = true; saveCanvas(); }
       } else {
@@ -262,8 +289,201 @@ async function loadCanvas() {
   }
 }
 
+async function saveToSupabase() {
+  if (!supabase && !pgPool) return false;
+  if (isSaving) return true;
+  if (pendingUpserts.size === 0 && pendingDeletes.size === 0) return true;
+
+  isSaving = true;
+  // snapshot and clear to allow new draws during save
+  const upserts = new Map(pendingUpserts);
+  const deletes = new Set(pendingDeletes);
+  pendingUpserts.clear();
+  pendingDeletes.clear();
+
+  const totalOps = upserts.size + deletes.size;
+  console.log(`[save] saving ${totalOps} ops (upserts=${upserts.size} deletes=${deletes.size}) totalPixels=${canvasData.size}...`);
+
+  try {
+    // Group operations by chunk
+    const chunkOps = new Map(); // chunkKey -> {cx, cy, upserts: Map<localIdx, colorId>, deletes: Set<localIdx>}
+
+    for (const [key, color] of upserts) {
+      const [x, y] = key.split(",").map(Number);
+      const cx = Math.floor(x / CHUNK_SIZE);
+      const cy = Math.floor(y / CHUNK_SIZE);
+      const lx = x - cx * CHUNK_SIZE;
+      const ly = y - cy * CHUNK_SIZE;
+      const localIdx = ChunkCodec.getIndex(lx, ly);
+      const ck = `${cx},${cy}`;
+      if (!chunkOps.has(ck)) chunkOps.set(ck, { cx, cy, upserts: new Map(), deletes: new Set() });
+      chunkOps.get(ck).upserts.set(localIdx, color);
+    }
+    for (const key of deletes) {
+      const [x, y] = key.split(",").map(Number);
+      const cx = Math.floor(x / CHUNK_SIZE);
+      const cy = Math.floor(y / CHUNK_SIZE);
+      const lx = x - cx * CHUNK_SIZE;
+      const ly = y - cy * CHUNK_SIZE;
+      const localIdx = ChunkCodec.getIndex(lx, ly);
+      const ck = `${cx},${cy}`;
+      if (!chunkOps.has(ck)) chunkOps.set(ck, { cx, cy, upserts: new Map(), deletes: new Set() });
+      chunkOps.get(ck).deletes.add(localIdx);
+    }
+
+    // Process each affected chunk: read → decode → apply ops → encode → upsert/delete
+    const savePromises = [];
+    for (const [ck, ops] of chunkOps) {
+      savePromises.push(saveChunkToSupabase(ops.cx, ops.cy, ops.upserts, ops.deletes));
+    }
+
+    const results = await Promise.all(savePromises);
+    const failedCount = results.filter(r => !r).length;
+    if (failedCount > 0) {
+      console.error(`[save] ${failedCount}/${chunkOps.size} chunks failed to save, re-queuing...`);
+      for (const [ck, ops] of chunkOps) {
+        for (const [localIdx, colorId] of ops.upserts) {
+          const xy = ChunkCodec.getXY(localIdx);
+          const gx = ops.cx * CHUNK_SIZE + xy.x;
+          const gy = ops.cy * CHUNK_SIZE + xy.y;
+          pendingUpserts.set(`${gx},${gy}`, colorId);
+        }
+        for (const localIdx of ops.deletes) {
+          const xy = ChunkCodec.getXY(localIdx);
+          const gx = ops.cx * CHUNK_SIZE + xy.x;
+          const gy = ops.cy * CHUNK_SIZE + xy.y;
+          pendingDeletes.add(`${gx},${gy}`);
+        }
+      }
+      isSaving = false;
+      return false;
+    }
+
+    console.log(`[save] ${totalOps} ops saved across ${chunkOps.size} chunks, remaining pending=${pendingUpserts.size + pendingDeletes.size}`);
+    isSaving = false;
+    return true;
+  } catch (e) {
+    console.error("[save] Supabase error:", e.message);
+    // Re-queue all operations on exception
+    for (const [key, color] of upserts) pendingUpserts.set(key, color);
+    for (const key of deletes) pendingDeletes.add(key);
+    isSaving = false;
+    return false;
+  }
+}
+
+async function saveChunkToSupabase(cx, cy, upserts, deletes) {
+  const client = pgPool ? await pgPool.connect() : null;
+  try {
+    // Read existing chunk data (if any)
+    let pixels = [];
+    let existing;
+
+    if (supabase && !usePgFallback) {
+      const result = await supabase
+        .from(CHUNK_TABLE)
+        .select("data")
+        .eq("chunk_x", cx)
+        .eq("chunk_y", cy)
+        .single();
+      if (result.error && result.error.code !== "PGRST116") {
+        console.error(`[save] chunk ${cx},${cy} read error:`, result.error.message);
+        return false;
+      }
+      existing = result.data;
+    } else if (pgPool) {
+      const result = await client.query(
+        `SELECT data FROM ${CHUNK_TABLE} WHERE chunk_x = $1 AND chunk_y = $2`,
+        [cx, cy]
+      );
+      existing = result.rows[0];
+    } else {
+      return false;
+    }
+
+    if (existing && existing.data) {
+      const buf = bufferToUint8Array(existing.data);
+      pixels = ChunkCodec.decode(buf);
+    }
+
+    // Apply deletions
+    if (deletes.size > 0) {
+      pixels = pixels.filter(p => {
+        const idx = ChunkCodec.getIndex(p.x, p.y);
+        return !deletes.has(idx);
+      });
+    }
+
+    // Apply upserts (color changes — add or replace)
+    if (upserts.size > 0) {
+      const pixelMap = new Map();
+      for (const p of pixels) {
+        pixelMap.set(ChunkCodec.getIndex(p.x, p.y), { x: p.x, y: p.y, colorId: p.colorId });
+      }
+      for (const [localIdx, colorId] of upserts) {
+        const xy = ChunkCodec.getXY(localIdx);
+        pixelMap.set(localIdx, { x: xy.x, y: xy.y, colorId });
+      }
+      pixels = Array.from(pixelMap.values());
+    }
+
+    // Encode and save
+    if (pixels.length === 0) {
+      // Delete the empty chunk
+      if (supabase) {
+        const { error: delErr } = await supabase
+          .from(CHUNK_TABLE)
+          .delete()
+          .eq("chunk_x", cx)
+          .eq("chunk_y", cy);
+        if (delErr) {
+          console.error(`[save] chunk ${cx},${cy} delete error:`, delErr.message);
+          return false;
+        }
+      } else if (pgPool) {
+        await client.query(
+          `DELETE FROM ${CHUNK_TABLE} WHERE chunk_x = $1 AND chunk_y = $2`,
+          [cx, cy]
+        );
+      }
+    } else {
+      const encoded = ChunkCodec.encode(pixels);
+      if (supabase) {
+        const hexData = bufferToHex(encoded);
+        const { error: upsertErr } = await supabase
+          .from(CHUNK_TABLE)
+          .upsert({
+            chunk_x: cx,
+            chunk_y: cy,
+            data: hexData,
+            pixel_count: pixels.length,
+            updated_at: new Date().toISOString(),
+          }, { onConflict: ["chunk_x", "chunk_y"] });
+        if (upsertErr) {
+          console.error(`[save] chunk ${cx},${cy} upsert error:`, upsertErr.message);
+          return false;
+        }
+      } else if (pgPool) {
+        const buf = bufferToHex(encoded);
+        await client.query(
+          `INSERT INTO ${CHUNK_TABLE} (chunk_x, chunk_y, data, pixel_count, updated_at) VALUES ($1, $2, $3, $4, NOW())
+           ON CONFLICT (chunk_x, chunk_y) DO UPDATE SET data = $3, pixel_count = $4, updated_at = NOW()`,
+          [cx, cy, buf, pixels.length]
+        );
+      }
+    }
+
+    return true;
+  } catch (e) {
+    console.error(`[save] chunk ${cx},${cy} exception:`, e.message);
+    return false;
+  } finally {
+    if (client) client.release();
+  }
+}
+
 async function saveCanvas() {
-  if (supabase) {
+  if (supabase || pgPool) {
     if (pendingUpserts.size === 0 && pendingDeletes.size === 0) return;
     try {
       await saveToSupabase();
@@ -309,7 +529,7 @@ process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 
 // ---- Health ----
-app.get("/health", (req, res) => res.json({ ok: true, ready, pixels: canvasData.size, storage: supabase ? "supabase" : "file", error: loadError || undefined }));
+app.get("/health", (req, res) => res.json({ ok: true, ready, pixels: canvasData.size, storage: (supabase || pgPool) ? "supabase" : "file", usePg: usePgFallback, error: loadError || undefined }));
 
 // ---- Viewport API ----
 // GET /api/pixels?x0=&y0=&x1=&y1=  (grid coords)
@@ -352,7 +572,59 @@ app.get("/api/pixels", async (req, res) => {
   return res.json({ pixels: out, truncated: out.length >= MAX_VIEWPORT_PIXELS });
 });
 
-// Lightweight meta endpoint for initial viewport decision
+// ---- Chunk API ----
+// GET /api/chunks?cx=&cy=  returns binary chunk data
+app.get("/api/chunks", async (req, res) => {
+  if (!supabase && !pgPool) {
+    return res.status(503).json({ error: "no db" });
+  }
+  const cx = parseInt(req.query.cx, 10);
+  const cy = parseInt(req.query.cy, 10);
+  if (!Number.isInteger(cx) || !Number.isInteger(cy)) {
+    return res.status(400).json({ error: "cx,cy required as integers" });
+  }
+  let data;
+  try {
+    if (supabase && !usePgFallback) {
+      const result = await supabase
+        .from(CHUNK_TABLE)
+        .select("data")
+        .eq("chunk_x", cx)
+        .eq("chunk_y", cy)
+        .single();
+      if (result.error) {
+        if (result.error.code === "PGRST116") {
+          return res.status(404).json({ error: "no chunk" });
+        }
+        return res.status(500).json({ error: result.error.message });
+      }
+      data = result.data;
+    } else if (pgPool) {
+      const pgClient = await pgPool.connect();
+      try {
+        const result = await pgClient.query(
+          `SELECT data FROM ${CHUNK_TABLE} WHERE chunk_x = $1 AND chunk_y = $2`,
+          [cx, cy]
+        );
+        if (result.rows.length === 0) {
+          return res.status(404).json({ error: "no chunk" });
+        }
+        data = result.rows[0];
+      } finally {
+        pgClient.release();
+      }
+    }
+    const buf = bufferToUint8Array(data.data);
+    res.set("Content-Type", "application/octet-stream");
+    res.set("Cache-Control", "public, max-age=60");
+    return res.send(Buffer.from(buf));
+  } catch (e) {
+    console.error("[api/chunks] error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---- Meta endpoint ----
 app.get("/api/meta", (req, res) => {
   res.set("Cache-Control", "public, max-age=5, s-maxage=10");
   res.json({ pixels: canvasData.size, ready, storage: supabase ? "supabase" : "file" });
@@ -369,6 +641,9 @@ app.use(express.static(path.join(__dirname, "public"), {
     }
   }
 }));
+
+// Serve shared/ (chunk codec) for client-side use
+app.use("/shared", express.static(path.join(__dirname, "shared")));
 
 function isValidDraw(payload) {
   if (!payload || typeof payload !== "object") return false;
