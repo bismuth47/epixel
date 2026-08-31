@@ -1156,8 +1156,8 @@
         } else {
           pts = getLinePixels(x0,y0,x1,y1, shiftDown);
         }
-        const isEraser = isEraserStroke || selectedColor.toLowerCase() === ERASER_COLOR;
-        const previewColor = isEraser ? "#ffffff" : selectedColor;
+        const isEraser = isEraserStroke;
+        const previewColor = selectedColor;
         if(isEraser){
           ctx.fillStyle = "#ffffff";
           ctx.globalAlpha = 0.92;
@@ -1222,7 +1222,7 @@
             ctx.strokeRect(hoverGrid.x * PIXEL_SIZE, hoverGrid.y * PIXEL_SIZE, PIXEL_SIZE + pad, PIXEL_SIZE + pad);
             ctx.setLineDash([]);
           } else {
-          const isEraser = selectedColor.toLowerCase() === ERASER_COLOR;
+          const isEraser = isEraserStroke;
           if (isEraser) {
             ctx.fillStyle = "#ffffff";
             ctx.globalAlpha = 0.9;
