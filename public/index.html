@@ -719,7 +719,7 @@
       const cx = tile.tx;
       const cy = tile.ty;
       const url = `/api/chunks?cx=${cx}&cy=${cy}`;
-      const res = await fetch(url);
+      const res = await fetch(url, { cache: "no-store" });
       if(res.status === 404){
         // No chunk for this tile — empty, mark as fetched
         fetchedTiles.add(key);

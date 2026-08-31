@@ -1,0 +1,10 @@
+node_modules
+npm-debug.log
+.git
+.gitignore
+.env
+canvas.json
+canvas.json.backup*
+canvas-codes-backup*
+supabase-backup*.json
+.DS_Store

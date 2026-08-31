@@ -108,6 +108,21 @@ if (pgPool) {
   console.log("[supabase] pg pool available as fallback");
 }
 
+// ── Storage mode determination ──
+// Local: file (canvas.json) — no SUPABASE env → isolated, no side effect on production
+// Production (Render): supabase — MUST have DB, never fall back to file
+const STORAGE_MODE = (supabase || pgPool) ? "supabase" : "file";
+const IS_PRODUCTION = process.env.NODE_ENV === "production" || process.env.RENDER === "true" || process.env.REQUIRE_SUPABASE === "true";
+if (IS_PRODUCTION && STORAGE_MODE === "file") {
+  console.error("[fatal] SUPABASE not configured in production — refusing to start with file storage (would expose empty/lossy canvas)");
+  console.error("        Set SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY (or ANON_KEY) and SUPABASE_DB_PASSWORD in Render env vars");
+  process.exit(1);
+}
+if (STORAGE_MODE === "supabase" && fs.existsSync(DATA_FILE)) {
+  console.warn(`[storage] DB mode active — local ${path.basename(DATA_FILE)} exists but will be IGNORED (prevents local canvas.json from affecting production map)`);
+}
+console.log(`[storage] mode=${STORAGE_MODE} production=${IS_PRODUCTION}`);
+
 // ---- Canvas Data (infinite, sparse) ----
 const canvasData = new Map();
 let dirty = false;
@@ -265,6 +280,8 @@ async function loadCanvas() {
       ready = true;
     }
   } else {
+    // file mode: local dev only (production would have exited above)
+    console.log("[load] file mode — using local canvas.json (isolated from production)");
     try {
       if (fs.existsSync(DATA_FILE)) {
         const raw = fs.readFileSync(DATA_FILE, "utf-8");
@@ -596,6 +613,7 @@ app.get("/api/chunks", async (req, res) => {
         .single();
       if (result.error) {
         if (result.error.code === "PGRST116") {
+          res.set("Cache-Control", "no-cache, no-store, must-revalidate");
           return res.status(404).json({ error: "no chunk" });
         }
         return res.status(500).json({ error: result.error.message });
@@ -609,6 +627,7 @@ app.get("/api/chunks", async (req, res) => {
           [cx, cy]
         );
         if (result.rows.length === 0) {
+          res.set("Cache-Control", "no-cache, no-store, must-revalidate");
           return res.status(404).json({ error: "no chunk" });
         }
         data = result.rows[0];
@@ -618,7 +637,7 @@ app.get("/api/chunks", async (req, res) => {
     }
     const buf = bufferToUint8Array(data.data);
     res.set("Content-Type", "application/octet-stream");
-    res.set("Cache-Control", "public, max-age=60");
+    res.set("Cache-Control", "no-cache, no-store, must-revalidate");
     return res.send(Buffer.from(buf));
   } catch (e) {
     console.error("[api/chunks] error:", e.message);
@@ -739,12 +758,12 @@ io.on("connection", (socket) => {
       if (canvasData.has(key)) canvasData.delete(key);
       pendingUpserts.delete(key);
       pendingDeletes.add(key);
-      if (!supabase) dirty = true;
+      if (!supabase && !pgPool) dirty = true;
     } else {
       canvasData.set(key, code);
       pendingDeletes.delete(key);
       pendingUpserts.set(key, code);
-      if (!supabase) dirty = true;
+      if (!supabase && !pgPool) dirty = true;
     }
     io.emit("draw", { x, y, color: code, totalPixels: canvasData.size });
   });
@@ -768,7 +787,7 @@ io.on("connection", (socket) => {
       }
       normalizedBatch.push({ x, y, color: code });
     }
-    if (!supabase) dirty = true;
+    if (!supabase && !pgPool) dirty = true;
     io.emit("drawBatch", { pixels: normalizedBatch, totalPixels: canvasData.size });
   });
 
