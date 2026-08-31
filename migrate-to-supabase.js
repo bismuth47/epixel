@@ -18,13 +18,13 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 const TABLE = "canvas_pixels";
 
-// ── Color code mapping (0–26, excludes eraser white) ──
+// ── Color code mapping (0–27, excludes eraser white) ──
 const CODE_TO_COLOR = [
   "#175145","#2e8065","#51b341","#9bd547","#fff971","#ff7f4f",
   "#ff4f4f","#ee3046","#df426e","#ff88dd","#a62654","#621b52",
-  "#371848","#0c082a","#261152","#272573","#4876bb","#7fd3e6",
+  "#2f154d","#000000","#333333","#272573","#4876bb","#7fd3e6",
   "#c7f7f2","#bbbbbb","#666666","#fdcbb0","#d29c8a",
-  "#9e4d4d","#712835","#5d1835","#35082a"
+  "#9e4d4d","#712835","#5d1835","#35082a","#ffbc60"
 ];
 const COLOR_TO_CODE = new Map(CODE_TO_COLOR.map((c, i) => [c.toLowerCase(), i]));
 const ERASER_CODE = 255;
@@ -75,7 +75,7 @@ async function ensureTable() {
 CREATE TABLE IF NOT EXISTS ${TABLE} (
   x INTEGER NOT NULL,
   y INTEGER NOT NULL,
-  color INTEGER NOT NULL CHECK (color >= 0 AND color <= 26),
+  color INTEGER NOT NULL CHECK (color >= 0 AND color <= 27),
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW(),
   PRIMARY KEY (x, y)
@@ -108,7 +108,7 @@ async function migrate() {
 
    for (const [key, color] of entries) {
     const code = typeof color === "string" ? hexToCode(color) : color;
-    if (code === undefined || code === ERASER_CODE || code < 0 || code > 26) {
+    if (code === undefined || code === ERASER_CODE || code < 0 || code > 27) {
       removed++;
       continue;
     }

@@ -1,5 +1,5 @@
 /**
- * Migration script: Convert existing Supabase color values from hex strings → numeric codes (0–26)
+ * Migration script: Convert existing Supabase color values from hex strings → numeric codes (0–27)
  *
  * SAFE approach: reads all data, converts hex→code, saves a local backup
  * (canvas-codes-backup.json), then UPSERTS codes in-place. No rows are
@@ -43,13 +43,13 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const TABLE = "canvas_pixels";
 const BACKUP_FILE = path.join(__dirname, "canvas-codes-backup.json");
 
-// ── Color code mapping (0–26, excludes eraser white #ffffff) ──
+// ── Color code mapping (0–27, excludes eraser white #ffffff) ──
 const CODE_TO_COLOR = [
   "#175145","#2e8065","#51b341","#9bd547","#fff971","#ff7f4f",
   "#ff4f4f","#ee3046","#df426e","#ff88dd","#a62654","#621b52",
-  "#371848","#0c082a","#261152","#272573","#4876bb","#7fd3e6",
+  "#2f154d","#000000","#333333","#272573","#4876bb","#7fd3e6",
   "#c7f7f2","#bbbbbb","#666666","#fdcbb0","#d29c8a",
-  "#9e4d4d","#712835","#5d1835","#35082a"
+  "#9e4d4d","#712835","#5d1835","#35082a","#ffbc60"
 ];
 const COLOR_TO_CODE = new Map(CODE_TO_COLOR.map((c, i) => [c.toLowerCase(), i]));
 const ERASER_CODE = 255;
@@ -100,9 +100,9 @@ ALTER TABLE ${TABLE}
 ALTER TABLE ${TABLE}
   ALTER COLUMN color SET NOT NULL;
 
--- 4. Add new CHECK constraint for codes 0–26
+-- 4. Add new CHECK constraint for codes 0–27
 ALTER TABLE ${TABLE}
-  ADD CONSTRAINT ${TABLE}_color_check CHECK (color >= 0 AND color <= 26);
+  ADD CONSTRAINT ${TABLE}_color_check CHECK (color >= 0 AND color <= 27);
 `;
 
 // Detect whether the column is already INTEGER (migration already done)

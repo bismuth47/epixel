@@ -155,22 +155,22 @@
   const MAX_GRID_LINES_PER_AXIS = 400;  // 片軸あたりの最大線本数（50 -> 400: 大画面ズームアウト時も描画）
 
   const COLORS = [
-    "#175145","#2e8065","#51b341","#9bd547","#fff971","#ff7f4f",
-    "#ff4f4f","#ee3046","#df426e","#ff88dd","#a62654","#621b52",
-    "#371848","#0c082a","#261152","#272573","#4876bb","#7fd3e6",
-    "#c7f7f2","#ffffff","#bbbbbb","#666666","#fdcbb0","#d29c8a",
-    "#9e4d4d","#712835","#5d1835","#35082a"
+    "#175145","#2e8065","#51b341","#9bd547","#fff971","#ffbc60",
+    "#ff7f4f","#ff4f4f","#ee3046","#ff88dd","#df426e","#a62654","#621b52",
+    "#2f154d","#272573","#4876bb","#7fd3e6","#c7f7f2","#ffffff","#bbbbbb",
+    "#666666","#333333","#000000","#35082a","#5d1835","#712835","#9e4d4d",
+    "#d29c8a","#fdcbb0"
   ];
 
-  // ── Color code mapping (0–26 = 27 drawable colors; white/eraser excluded) ──
-  // CODE_TO_COLOR has 27 entries. COLORS (above, 28) includes the eraser for
+  // ── Color code mapping (0–27 = 28 drawable colors; white/eraser excluded) ──
+  // CODE_TO_COLOR has 28 entries. COLORS (above, 29) includes the eraser for
   // palette display only. The eraser is never stored as a code.
   const CODE_TO_COLOR = [
     "#175145","#2e8065","#51b341","#9bd547","#fff971","#ff7f4f",
     "#ff4f4f","#ee3046","#df426e","#ff88dd","#a62654","#621b52",
-    "#371848","#0c082a","#261152","#272573","#4876bb","#7fd3e6",
+    "#2f154d","#000000","#333333","#272573","#4876bb","#7fd3e6",
     "#c7f7f2","#bbbbbb","#666666","#fdcbb0","#d29c8a",
-    "#9e4d4d","#712835","#5d1835","#35082a"
+    "#9e4d4d","#712835","#5d1835","#35082a","#ffbc60"
   ];
   const COLOR_TO_CODE = new Map(CODE_TO_COLOR.map((c, i) => [c.toLowerCase(), i]));
   const ERASER_CODE = 255; // special sentinel, not a stored color

@@ -41,32 +41,32 @@ if (SUPABASE_URL && SUPABASE_DB_PASSWORD) {
   }
 }
 
-// ── Color code mapping (0–26 = 27 drawable colors, white/eraser is special) ──
+// ── Color code mapping (0–27 = 28 drawable colors, white/eraser is special) ──
 const CODE_TO_COLOR = [
   "#175145","#2e8065","#51b341","#9bd547","#fff971","#ff7f4f",
   "#ff4f4f","#ee3046","#df426e","#ff88dd","#a62654","#621b52",
-  "#371848","#0c082a","#261152","#272573","#4876bb","#7fd3e6",
+  "#2f154d","#000000","#333333","#272573","#4876bb","#7fd3e6",
   "#c7f7f2","#bbbbbb","#666666","#fdcbb0","#d29c8a",
-  "#9e4d4d","#712835","#5d1835","#35082a"
+  "#9e4d4d","#712835","#5d1835","#35082a","#ffbc60"
 ];
 const COLOR_TO_CODE = new Map(CODE_TO_COLOR.map((c, i) => [c.toLowerCase(), i]));
 const VALID_CODES = new Set(CODE_TO_COLOR.map((_, i) => i));
 const ERASER_CODE = 255; // special sentinel, never stored in DB
 const ERASER_COLOR = "#ffffff";
 
-// Convert hex string or numeric code to a numeric code (0–26) or ERASER_CODE.
+// Convert hex string or numeric code to a numeric code (0–27) or ERASER_CODE.
 // Handles: numeric codes, hex strings (legacy), numeric-looking text (edge case).
 // Returns undefined for invalid colors.
 function normalizeColor(color) {
   if (typeof color === "number" && Number.isInteger(color)) {
-    if (color === ERASER_CODE || (color >= 0 && color <= 26)) return color;
+    if (color === ERASER_CODE || (color >= 0 && color <= 27)) return color;
     return undefined;
   }
   if (typeof color !== "string") return undefined;
   // Check for numeric code stored as text (e.g. "5")
   if (/^\d+$/.test(color)) {
     const num = parseInt(color, 10);
-    if (num === ERASER_CODE || (num >= 0 && num <= 26)) return num;
+    if (num === ERASER_CODE || (num >= 0 && num <= 27)) return num;
     return undefined;
   }
   // Legacy hex string
