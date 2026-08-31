@@ -8,6 +8,8 @@ const { createClient } = require("@supabase/supabase-js");
 const { Pool } = require("pg");
 const ChunkCodec = require("./shared/chunk-codec");
 
+try { require("dotenv").config(); } catch (e) {}
+
 const PORT = process.env.PORT || 3000;
 const DATA_FILE = path.join(__dirname, "canvas.json");
 const SAVE_INTERVAL_MS = 2000;
