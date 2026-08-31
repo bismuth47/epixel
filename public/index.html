@@ -1661,6 +1661,7 @@
       offsetX += before.x - after.x;
       offsetY += before.y - after.y;
       scheduleRender(); updateInfo(); updateToolUI();
+      scheduleViewportFetchThrottled();
       return;
     }
     const absX = Math.abs(e.deltaX);
@@ -1708,11 +1709,11 @@
         penLastGrid=grid;
         penStrokeMap = new Map();
         const k=`${grid.x},${grid.y}`;
-        const prev = getPixel(p.x,p.y) || null;
+        const prev = getPixel(grid.x,grid.y) || null;
         const normalized = selectedColor.toLowerCase();
         const prevNorm = prev ? prev.toLowerCase() : null;
         if(prevNorm !== normalized) penStrokeMap.set(k, {x:grid.x, y:grid.y, prev: prev, newColor: normalized});
-        if(normalized === ERASER_COLOR) deletePixel(p.x,p.y); else setPixel(p.x,p.y, normalized);
+        if(normalized === ERASER_COLOR) deletePixel(grid.x,grid.y); else setPixel(grid.x,grid.y, normalized);
         scheduleRender(); updateInfo();
         if(socket && socket.connected) socket.emit("draw", {x:grid.x, y:grid.y, color: toWireColor(normalized)});
       } else if(currentTool===TOOLS.RECT || currentTool===TOOLS.CIRCLE || currentTool===TOOLS.LINE){
@@ -1759,6 +1760,7 @@
       offsetX = dotPanStartOffset.x - dx / scale;
       offsetY = dotPanStartOffset.y - dy / scale;
       scheduleRender(); updateInfo();
+      scheduleViewportFetchThrottled();
       return;
     }
     if(e.touches.length===1 && touchMode==='draw'){
@@ -1843,6 +1845,7 @@
           doDraw(grid.x, grid.y);
         } else {
           scheduleRender();
+          scheduleViewportFetch();
         }
         wasPinch=false;
         dotHasMoved=false;
@@ -1855,6 +1858,7 @@
         lastTouchDist=null;
         lastTouchCenter=null;
         scheduleRender();
+        scheduleViewportFetch();
         return;
       }
       if(isDrawing){
