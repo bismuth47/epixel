@@ -3,6 +3,14 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="description" content="epixel - infinite collaborative pixel canvas">
+<meta name="theme-color" content="#1e1e1e">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="epixel">
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/icons/icon-192.png" type="image/png">
+<link rel="apple-touch-icon" href="/icons/icon-180.png">
 <title>epixel</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -318,6 +326,8 @@
   const fetchingTiles = new Set();
   let fetchingCount = 0;
   function hideLoading(){
+    // オフライン時はキャンバスに入れないためローディングを閉じない
+    if(!navigator.onLine) return;
     if(loadingEl) loadingEl.classList.add("hidden");
     setTimeout(()=>{ if(loadingEl) loadingEl.style.display="none"; }, 400);
   }
@@ -326,8 +336,16 @@
     if(text && loadingTextEl) loadingTextEl.textContent = text;
     if(sub !== undefined && loadingSubEl) loadingSubEl.textContent = sub;
   }
+  function isOffline(){ return !navigator.onLine; }
+  function updateOfflineLoading(){
+    if(isOffline()){
+      showLoading("オフラインです", "インターネット接続を確認してください。接続後に自動的に読み込みます。");
+      return true;
+    }
+    return false;
+  }
 
-  // ---- Rate limit: 2 draws per 1000ms (all tools, stroke unit) ----
+  // ---- Rate limit: 3 draws per 1000ms (all tools, stroke unit) ----
   let drawTimes = [];
   const DRAW_LIMIT = 3;
   const DRAW_WINDOW_MS = 1000;
@@ -356,6 +374,35 @@
       gridWarn.textContent = 'グリッド表示時のみ使用できます。ズームインしてください';
     }, delay);
   }
+  // ---- Undo rate limit: 10/s separate bucket ----
+  let undoTimes = [];
+  const UNDO_LIMIT = 10;
+  const UNDO_WINDOW_MS = 1000;
+  let undoLimitWarnTimer = null;
+  function canUndo(){
+    const now = Date.now();
+    undoTimes = undoTimes.filter(t => now - t < UNDO_WINDOW_MS);
+    return undoTimes.length < UNDO_LIMIT;
+  }
+  function recordUndo(){ undoTimes.push(Date.now()); }
+  function getUndoCooldownMs(){
+    if(undoTimes.length < UNDO_LIMIT) return 0;
+    const oldest = undoTimes[0];
+    return Math.max(0, UNDO_WINDOW_MS - (Date.now() - oldest));
+  }
+  function showUndoLimitWarn(){
+    const ms = getUndoCooldownMs();
+    const sec = (ms/1000).toFixed(1);
+    gridWarn.textContent = `巻き戻しは1秒に10回までです（あと${sec}秒）`;
+    gridWarn.style.display = 'block';
+    clearTimeout(gridWarnTimer);
+    clearTimeout(undoLimitWarnTimer);
+    const delay = ms > 0 ? ms + 200 : 1200;
+    undoLimitWarnTimer = setTimeout(()=>{
+      gridWarn.style.display='none';
+      gridWarn.textContent = 'グリッド表示時のみ使用できます。ズームインしてください';
+    }, delay);
+  }
 
   // ---- Undo/Redo (local only, own operations) ----
   const MAX_UNDO = 50;
@@ -369,20 +416,23 @@
      updateUndoUI();
    }
    function cancelPenStroke(){
-     if(!penStrokeMap || penStrokeMap.size<=0) return;
-     for(const p of penStrokeMap.values()){
-       if(p.prev){ setPixel(p.x,p.y, p.prev); }
-       else { deletePixel(p.x,p.y); }
-     }
-     if(socket && socket.connected){
-       const batch=[];
-        for(const p of penStrokeMap.values()){
-          batch.push(p.prev===null ? {x:p.x,y:p.y,color:ERASER_CODE} : {x:p.x,y:p.y,color:toWireColor(p.prev)});
-        }
-       socket.emit("drawBatch", batch);
-     }
-     scheduleRender(); updateInfo();
-   }
+      if(!penStrokeMap || penStrokeMap.size<=0) return;
+      for(const p of penStrokeMap.values()){
+        if(p.prev){ setPixel(p.x,p.y, p.prev); }
+        else { deletePixel(p.x,p.y); }
+      }
+      if(socket && socket.connected){
+        const batch=[];
+         for(const p of penStrokeMap.values()){
+           batch.push(p.prev===null ? {x:p.x,y:p.y,color:ERASER_CODE} : {x:p.x,y:p.y,color:toWireColor(p.prev)});
+         }
+        // キャンセルはUndo扱いで別枠10/s + Ackで確実に戻す
+        socket.emit("undo", batch, (res)=>{
+          if(res && !res.ok && res.reason==="rateLimited") showUndoLimitWarn();
+        });
+      }
+      scheduleRender(); updateInfo();
+    }
   function updateUndoUI(){
     const ub = document.getElementById("undoBtn");
     const rb = document.getElementById("redoBtn");
@@ -398,24 +448,58 @@
   }
   function undo(){
     if(undoStack.length===0) return;
+    if(!canUndo()){ showUndoLimitWarn(); return; }
     const entry = undoStack.pop();
     const revert = entry.pixels.map(p=>({x:p.x, y:p.y, color: p.prev === null ? ERASER_CODE : toWireColor(p.prev)}));
+    // 自分のUndo: 応答性を保つため楽観的に即時反映しつつ、サーバーAckで確定/ロールバックする
     for(const p of entry.pixels){
       if(p.prev === null) deletePixel(p.x,p.y);
       else setPixel(p.x,p.y, p.prev);
     }
-    scheduleRender(); updateInfo(); updateUndoUI();
+    scheduleRender(); updateInfo();
     redoStack.push(entry);
     updateUndoUI();
+    recordUndo();
     if(socket && socket.connected){
-      if(revert.length===1) socket.emit("draw", revert[0]);
-      else socket.emit("drawBatch", revert);
+      let acked = false;
+      const timer = setTimeout(()=>{
+        if(acked) return;
+        // Ackが無い旧サーバー等: 成功扱いで何もしない（既に楽観反映済み）
+      }, 5000);
+      socket.emit("undo", revert, (res)=>{
+        acked = true;
+        clearTimeout(timer);
+        if(!res || res.ok) return;
+        // サーバーで拒否されたらロールバックして辻褄を合わせる
+        if(res.reason === "rateLimited"){
+          showUndoLimitWarn();
+        } else {
+          gridWarn.textContent = "巻き戻しに失敗しました";
+          gridWarn.style.display='block';
+          clearTimeout(gridWarnTimer);
+          gridWarnTimer = setTimeout(()=> gridWarn.style.display='none', 2000);
+        }
+        // revert the optimistic undo: re-apply newColor
+        const last = redoStack.pop();
+        if(last !== entry){
+          if(last) redoStack.push(last);
+          return;
+        }
+        for(const p of entry.pixels){
+          if(p.newColor === ERASER_COLOR || p.newColor === null) deletePixel(p.x,p.y);
+          else setPixel(p.x,p.y, p.newColor);
+        }
+        undoStack.push(entry);
+        scheduleRender(); updateInfo(); updateUndoUI();
+      });
     }
   }
   function redo(){
     if(redoStack.length===0) return;
+    if(!canUndo()){ showUndoLimitWarn(); return; }
     const entry = redoStack.pop();
     const reapply = entry.pixels.map(p=>({x:p.x, y:p.y, color: toWireColor(p.newColor)}));
+    // 自分のRedoもUndoと同様にAck待ち(別枠10/s) + 楽観反映
     for(const p of entry.pixels){
       if(p.newColor === ERASER_COLOR || p.newColor === null) deletePixel(p.x,p.y);
       else setPixel(p.x,p.y, p.newColor);
@@ -423,9 +507,33 @@
     scheduleRender(); updateInfo();
     undoStack.push(entry);
     updateUndoUI();
+    recordUndo();
     if(socket && socket.connected){
-      if(reapply.length===1) socket.emit("draw", reapply[0]);
-      else socket.emit("drawBatch", reapply);
+      let acked = false;
+      const timer = setTimeout(()=>{}, 5000);
+      socket.emit("undo", reapply, (res)=>{
+        acked = true;
+        clearTimeout(timer);
+        if(!res || res.ok) return;
+        if(res.reason === "rateLimited") showUndoLimitWarn();
+        else {
+          gridWarn.textContent = "やり直しに失敗しました";
+          gridWarn.style.display='block';
+          clearTimeout(gridWarnTimer);
+          gridWarnTimer = setTimeout(()=> gridWarn.style.display='none', 2000);
+        }
+        const last = undoStack.pop();
+        if(last !== entry){
+          if(last) undoStack.push(last);
+          return;
+        }
+        for(const p of entry.pixels){
+          if(p.prev === null) deletePixel(p.x,p.y);
+          else setPixel(p.x,p.y, p.prev);
+        }
+        redoStack.push(entry);
+        scheduleRender(); updateInfo(); updateUndoUI();
+      });
     }
   }
 
@@ -758,6 +866,10 @@
     }
   }
   async function fetchViewport(force){
+    if(isOffline()){
+      updateOfflineLoading();
+      return;
+    }
     const tiles = getTilesForViewport();
     // 同一セッションで再生成しない: 未取得のみを対象にし、sliceはその後に適用
     const unfetched = tiles.filter(t=> !fetchedTiles.has(t.key) && !fetchingTiles.has(t.key));
@@ -1327,12 +1439,14 @@
     } else {
       setPixel(gx,gy, normalized);
     }
-    scheduleRender(); updateInfo();
-     if (socket && socket.connected) {
-       socket.emit("draw", { x: gx, y: gy, color: toWireColor(normalized) });
-     }
-   }
-   function doDrawBatch(pixelList){
+     scheduleRender(); updateInfo();
+      if (socket && socket.connected) {
+        socket.emit("draw", { x: gx, y: gy, color: toWireColor(normalized) }, (res)=>{
+          if(res && !res.ok && res.reason==="rateLimited") showDrawLimitWarn();
+        });
+      }
+    }
+    function doDrawBatch(pixelList){
     if(!pixelList || pixelList.length===0) return;
     if(!canDraw()){ showDrawLimitWarn(); return; }
     const normalized = getCurrentColor().toLowerCase();
@@ -1345,15 +1459,16 @@
       if(isEraser) deletePixel(p.x,p.y);
       else setPixel(p.x,p.y, normalized);
     }
-    scheduleRender(); updateInfo();
-    if(socket && socket.connected){
-      if(pixelList.length===1){
-        socket.emit("draw", {x:pixelList[0].x, y:pixelList[0].y, color: toWireColor(normalized)});
-       } else {
-         socket.emit("drawBatch", pixelList.map(p=>({x:p.x,y:p.y,color: toWireColor(normalized)})));
-       }
-     }
-   }
+     scheduleRender(); updateInfo();
+     if(socket && socket.connected){
+       const cb = (res)=>{ if(res && !res.ok && res.reason==="rateLimited") showDrawLimitWarn(); };
+       if(pixelList.length===1){
+         socket.emit("draw", {x:pixelList[0].x, y:pixelList[0].y, color: toWireColor(normalized)}, cb);
+        } else {
+          socket.emit("drawBatch", pixelList.map(p=>({x:p.x,y:p.y,color: toWireColor(normalized)})), cb);
+        }
+      }
+    }
    function applyDrawBatchNoUndo(pixelList){
     if(!pixelList || pixelList.length===0) return;
     const normalized = selectedColor.toLowerCase();
@@ -1368,15 +1483,15 @@
     }
   }
   function doErase(gx, gy) {
-    const prev = getPixel(gx,gy) || null;
-    if(prev === null) return;
-    pushUndo({pixels:[{x:gx, y:gy, prev: prev, newColor: ERASER_COLOR}]});
-    deletePixel(gx,gy);
-    scheduleRender(); updateInfo();
-    if (socket && socket.connected) {
-      socket.emit("draw", { x: gx, y: gy, color: ERASER_CODE });
-    }
-  }
+     const prev = getPixel(gx,gy) || null;
+     if(prev === null) return;
+     pushUndo({pixels:[{x:gx, y:gy, prev: prev, newColor: ERASER_COLOR}]});
+     deletePixel(gx,gy);
+     scheduleRender(); updateInfo();
+     if (socket && socket.connected) {
+       socket.emit("draw", { x: gx, y: gy, color: ERASER_CODE }, (res)=>{ if(res && !res.ok && res.reason==="rateLimited") showDrawLimitWarn(); });
+     }
+   }
   function doFill(gx, gy){
     if(!isToolAllowed(TOOLS.FILL)) { showGridWarn(); return; }
     if(!canDraw()){ showDrawLimitWarn(); return; }
@@ -1516,10 +1631,10 @@
       }
       if(normalized === ERASER_COLOR) deletePixel(grid.x,grid.y);
       else setPixel(grid.x,grid.y, normalized);
-      scheduleRender(); updateInfo();
-      if(socket && socket.connected) socket.emit("draw", {x:grid.x, y:grid.y, color: toWireColor(normalized)});
-      canvas.setPointerCapture && canvas.setPointerCapture(e.pointerId);
-    } else if(currentTool===TOOLS.RECT || currentTool===TOOLS.CIRCLE || currentTool===TOOLS.LINE){
+       scheduleRender(); updateInfo();
+       if(socket && socket.connected) socket.emit("draw", {x:grid.x, y:grid.y, color: toWireColor(normalized)}, (res)=>{ if(res && !res.ok && res.reason==="rateLimited") showDrawLimitWarn(); });
+       canvas.setPointerCapture && canvas.setPointerCapture(e.pointerId);
+     } else if(currentTool===TOOLS.RECT || currentTool===TOOLS.CIRCLE || currentTool===TOOLS.LINE){
       isDrawing = true;
       drawStartGrid = grid;
       drawCurrentGrid = grid;
@@ -1583,13 +1698,13 @@
           for(const p of toDraw){
               if(isEraser) deletePixel(p.x,p.y); else setPixel(p.x,p.y, normalized);
           }
-          scheduleRender(); updateInfo();
-          if(socket && socket.connected){
-            socket.emit("drawBatch", toDraw.map(p=>({x:p.x,y:p.y,color: toWireColor(normalized)})));
-          }
-          penLastGrid = grid;
-        }
-      } else if((currentTool===TOOLS.RECT || currentTool===TOOLS.CIRCLE || currentTool===TOOLS.LINE) && drawStartGrid){
+           scheduleRender(); updateInfo();
+           if(socket && socket.connected){
+             socket.emit("drawBatch", toDraw.map(p=>({x:p.x,y:p.y,color: toWireColor(normalized)})), (res)=>{ if(res && !res.ok && res.reason==="rateLimited") showDrawLimitWarn(); });
+           }
+           penLastGrid = grid;
+         }
+       } else if((currentTool===TOOLS.RECT || currentTool===TOOLS.CIRCLE || currentTool===TOOLS.LINE) && drawStartGrid){
         drawCurrentGrid = grid;
         scheduleRender(); updateInfo();
       }
@@ -1746,32 +1861,32 @@
         const prevNorm = prev ? prev.toLowerCase() : null;
         if(prevNorm !== normalized) penStrokeMap.set(k, {x:grid.x, y:grid.y, prev: prev, newColor: normalized});
         if(normalized === ERASER_COLOR) deletePixel(grid.x,grid.y); else setPixel(grid.x,grid.y, normalized);
-        scheduleRender(); updateInfo();
-        if(socket && socket.connected) socket.emit("draw", {x:grid.x, y:grid.y, color: toWireColor(normalized)});
-      } else if(currentTool===TOOLS.RECT || currentTool===TOOLS.CIRCLE || currentTool===TOOLS.LINE){
-        isDrawing=true;
-        drawStartGrid=grid;
-        drawCurrentGrid=grid;
-        scheduleRender();
-      }
-    } else if(e.touches.length===2){
-      if(isDotPanning){
-        isDotPanning=false;
-        dotHasMoved=false;
-      }
-      if(isDrawing){
-        if(currentTool===TOOLS.PEN && penStrokeMap && penStrokeMap.size>0){
-          cancelPenStroke();
-          penStrokeMap=null;
-          penLastGrid=null;
-        }
-        isDrawing=false;
-        drawStartGrid=null;
-        drawCurrentGrid=null;
-        penLastGrid=null;
-        scheduleRender();
-      }
-      touchMode='panzoom';
+         scheduleRender(); updateInfo();
+         if(socket && socket.connected) socket.emit("draw", {x:grid.x, y:grid.y, color: toWireColor(normalized)}, (res)=>{ if(res && !res.ok && res.reason==="rateLimited") showDrawLimitWarn(); });
+       } else if(currentTool===TOOLS.RECT || currentTool===TOOLS.CIRCLE || currentTool===TOOLS.LINE){
+         isDrawing=true;
+         drawStartGrid=grid;
+         drawCurrentGrid=grid;
+         scheduleRender();
+       }
+     } else if(e.touches.length===2){
+       if(isDotPanning){
+         isDotPanning=false;
+         dotHasMoved=false;
+       }
+       if(isDrawing){
+         if(currentTool===TOOLS.PEN && penStrokeMap && penStrokeMap.size>0){
+           cancelPenStroke();
+           penStrokeMap=null;
+           penLastGrid=null;
+         }
+         isDrawing=false;
+         drawStartGrid=null;
+         drawCurrentGrid=null;
+         penLastGrid=null;
+         scheduleRender();
+       }
+       touchMode='panzoom';
       wasPinch=true;
       const cx=(e.touches[0].clientX+e.touches[1].clientX)/2;
       const cy=(e.touches[0].clientY+e.touches[1].clientY)/2;
@@ -1821,11 +1936,11 @@
             for(const p of toDraw){
               if(isEraser) deletePixel(p.x,p.y); else setPixel(p.x,p.y, normalized);
             }
-            scheduleRender(); updateInfo();
-            if(socket && socket.connected) socket.emit("drawBatch", toDraw.map(p=>({x:p.x,y:p.y,color: toWireColor(normalized)})));
-            penLastGrid=grid;
-          }
-        } else if((currentTool===TOOLS.RECT || currentTool===TOOLS.CIRCLE || currentTool===TOOLS.LINE) && drawStartGrid){
+             scheduleRender(); updateInfo();
+             if(socket && socket.connected) socket.emit("drawBatch", toDraw.map(p=>({x:p.x,y:p.y,color: toWireColor(normalized)})), (res)=>{ if(res && !res.ok && res.reason==="rateLimited") showDrawLimitWarn(); });
+             penLastGrid=grid;
+           }
+         } else if((currentTool===TOOLS.RECT || currentTool===TOOLS.CIRCLE || currentTool===TOOLS.LINE) && drawStartGrid){
           drawCurrentGrid=grid;
           scheduleRender(); updateInfo();
         }
@@ -1955,15 +2070,37 @@
   // ---- Socket.io ----
   const socket = io();
 
+  // オフライン検出: PWA関係なくロード中にメッセージを出してキャンバスに入れない
+  if(updateOfflineLoading()){
+    // 初期オフライン時は以降の自動リトライを online 復帰時に行う
+  }
+  window.addEventListener("offline", ()=>{
+    if(!initialLoaded) updateOfflineLoading();
+    else {
+      // ロード後オフラインは topbar で分かるが、ロード中再オフラインもブロック
+      statusEl.className = "offline";
+      connTextEl.textContent = "オフライン";
+    }
+  });
+  window.addEventListener("online", ()=>{
+    if(!initialLoaded){
+      showLoading("再接続中...", "接続が復帰しました。読み込みを再開します。");
+      // 少し待ってから再試行 (SWやネットワークの安定待ち)
+      setTimeout(()=> fetchViewport(true), 300);
+    }
+  });
+
   // Long-load UX: update loading text after 3s if still loading
   setTimeout(()=>{
     if(!initialLoaded && loadingTextEl){
+      if(isOffline()) return;
       loadingTextEl.textContent = "サーバー起動中...";
       if(loadingSubEl) loadingSubEl.textContent = "Freeプランのため初回起動に30秒ほどかかる場合があります。しばらくお待ちください。";
     }
   }, 3000);
   setTimeout(()=>{
     if(!initialLoaded){
+      if(isOffline()) return;
       showLoading("読み込みに時間がかかっています", "ネットワークを確認するか、ページを再読み込みしてください。");
     }
   }, 15000);
@@ -1971,7 +2108,7 @@
   socket.on("connect", () => {
     statusEl.className = "online";
     connTextEl.textContent = "オンライン";
-    if(!initialLoaded) fetchViewport(true);
+    if(!initialLoaded && !isOffline()) fetchViewport(true);
   });
   socket.on("disconnect", () => {
     statusEl.className = "offline";
@@ -1982,7 +2119,7 @@
       worldPixelCount = info.pixels;
       pixCountEl.textContent = info.pixels;
     }
-    if(!initialLoaded) fetchViewport(true);
+    if(!initialLoaded && !isOffline()) fetchViewport(true);
   });
    socket.on("init", (data) => {
      // legacy full init (320k would be heavy) — keep for ?legacy=1
@@ -2024,16 +2161,27 @@
      }
     scheduleRender(); updateInfo();
   });
-  socket.on("userCount", (n) => {
-    userCountEl.textContent = `(${n}人接続中)`;
-  });
+   socket.on("userCount", (n) => {
+     userCountEl.textContent = `(${n}人接続中)`;
+   });
+   socket.on("rateLimited", (info) => {
+     if(info && info.type === "undo") showUndoLimitWarn();
+     else showDrawLimitWarn();
+   });
 
-  // initial render + viewport fetch (HTTP, no socket wait)
+   // PWA: Service Worker 登録 (ブラウザ標準バナーのみ、カスタムプロンプトなし)
+  if("serviceWorker" in navigator){
+    window.addEventListener("load", ()=>{
+      navigator.serviceWorker.register("/sw.js", {scope:"/"}).catch(e=> console.warn("[sw] register failed", e));
+    });
+  }
+
+   // initial render + viewport fetch (HTTP, no socket wait)
   scheduleRender(); updateInfo(); updateToolUI();
-  // Fetch viewport immediately via HTTP (does not wait for socket)
-  fetchViewport(true);
+  // Fetch viewport immediately via HTTP (does not wait for socket) — offline時はブロック
+  if(!isOffline()) fetchViewport(true);
   // Also poll ready if socket already connected
-  if(window.fetch) setTimeout(()=>{ if(!initialLoaded) fetchViewport(true); }, 800);
+  if(window.fetch) setTimeout(()=>{ if(!initialLoaded && !isOffline()) fetchViewport(true); }, 800);
 })();
 </script>
 </body>

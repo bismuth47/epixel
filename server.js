@@ -657,8 +657,11 @@ app.use(express.static(path.join(__dirname, "public"), {
   etag: true,
   lastModified: true,
   setHeaders(res, filePath) {
-    if (filePath.endsWith("index.html")) {
-      res.setHeader("Cache-Control", "no-cache");
+    if (filePath.endsWith("index.html") || filePath.endsWith("manifest.json") || filePath.endsWith("sw.js")) {
+      res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    }
+    if (filePath.endsWith("sw.js")) {
+      res.setHeader("Service-Worker-Allowed", "/");
     }
   }
 }));
@@ -693,8 +696,11 @@ function isValidDrawBatch(payload) {
 const DRAW_LIMIT = 3;
 const DRAW_WINDOW_MS = 1000;
 const BATCH_LIMIT = 20; // pen drag emits many small batches; allow higher burst
+const UNDO_LIMIT = 10;
+const UNDO_WINDOW_MS = 1000;
 const socketDrawTimes = new Map(); // socket.id -> number[] for single draw
 const socketBatchTimes = new Map(); // socket.id -> number[] for batch
+const socketUndoTimes = new Map(); // socket.id -> number[] for undo/redo (separate bucket)
 function checkRateLimit(socket){
   const now = Date.now();
   let times = socketDrawTimes.get(socket.id) || [];
@@ -732,6 +738,35 @@ function checkBatchRateLimit(socket, payloadLen){
   socketBatchTimes.set(socket.id, times);
   return true;
 }
+function checkUndoRateLimit(socket){
+  const now = Date.now();
+  let times = socketUndoTimes.get(socket.id) || [];
+  times = times.filter(t => now - t < UNDO_WINDOW_MS);
+  if(times.length >= UNDO_LIMIT) {
+    socketUndoTimes.set(socket.id, times);
+    return false;
+  }
+  times.push(now);
+  socketUndoTimes.set(socket.id, times);
+  return true;
+}
+function getUndoRetryAfterMs(socket){
+  const times = socketUndoTimes.get(socket.id) || [];
+  if(times.length < UNDO_LIMIT) return 0;
+  const oldest = times[0];
+  return Math.max(0, UNDO_WINDOW_MS - (Date.now() - oldest));
+}
+function getDrawRetryAfterMs(socket, isLargeBatch){
+  if(isLargeBatch){
+    const times = socketDrawTimes.get(socket.id) || [];
+    if(times.length < DRAW_LIMIT) return 0;
+    return Math.max(0, DRAW_WINDOW_MS - (Date.now() - times[0]));
+  } else {
+    const times = socketBatchTimes.get(socket.id) || [];
+    if(times.length < BATCH_LIMIT) return 0;
+    return Math.max(0, DRAW_WINDOW_MS - (Date.now() - times[0]));
+  }
+}
 
 // ---- Socket.io ----
 io.on("connection", (socket) => {
@@ -747,12 +782,21 @@ io.on("connection", (socket) => {
   }
   io.emit("userCount", io.engine.clientsCount);
 
-  socket.on("draw", (data) => {
-    if (!isValidDraw(data)) return;
-    if (!checkRateLimit(socket)) return;
+  socket.on("draw", (data, ack) => {
+    if (!isValidDraw(data)) {
+      if (typeof ack === "function") ack({ ok: false, reason: "invalid" });
+      return;
+    }
+    if (!checkRateLimit(socket)) {
+      if (typeof ack === "function") ack({ ok: false, reason: "rateLimited", retryAfterMs: Math.max(0, DRAW_WINDOW_MS - (Date.now() - (socketDrawTimes.get(socket.id)||[Date.now()])[0])) });
+      return;
+    }
     const { x, y, color } = data;
     const code = normalizeColor(color);
-    if (code === undefined) return;
+    if (code === undefined) {
+      if (typeof ack === "function") ack({ ok: false, reason: "invalid" });
+      return;
+    }
     const key = `${x},${y}`;
     if (code === ERASER_CODE) {
       if (canvasData.has(key)) canvasData.delete(key);
@@ -766,11 +810,19 @@ io.on("connection", (socket) => {
       if (!supabase && !pgPool) dirty = true;
     }
     io.emit("draw", { x, y, color: code, totalPixels: canvasData.size });
+    if (typeof ack === "function") ack({ ok: true });
   });
 
-  socket.on("drawBatch", (data) => {
-    if (!isValidDrawBatch(data)) return;
-    if (!checkBatchRateLimit(socket, data.length)) return;
+  socket.on("drawBatch", (data, ack) => {
+    if (!isValidDrawBatch(data)) {
+      if (typeof ack === "function") ack({ ok: false, reason: "invalid" });
+      return;
+    }
+    if (!checkBatchRateLimit(socket, data.length)) {
+      const isLarge = data.length > 10;
+      if (typeof ack === "function") ack({ ok: false, reason: "rateLimited", retryAfterMs: getDrawRetryAfterMs(socket, isLarge) });
+      return;
+    }
     const normalizedBatch = [];
     for (const { x, y, color } of data) {
       const code = normalizeColor(color);
@@ -789,11 +841,60 @@ io.on("connection", (socket) => {
     }
     if (!supabase && !pgPool) dirty = true;
     io.emit("drawBatch", { pixels: normalizedBatch, totalPixels: canvasData.size });
+    if (typeof ack === "function") ack({ ok: true });
+  });
+
+  // ---- Undo/Redo: separate rate limit bucket (10/s) + ack ----
+  // Client's own undo is ack-waited for consistency; others receive via normal draw/drawBatch broadcast.
+  socket.on("undo", (data, ack) => {
+    const hasAck = typeof ack === "function";
+    // Accept: single {x,y,color} , array [{x,y,color}], or {pixels:[...]}
+    let batch = null;
+    if (Array.isArray(data)) batch = data;
+    else if (data && Array.isArray(data.pixels)) batch = data.pixels;
+    else if (data && typeof data === "object" && "x" in data && "y" in data && "color" in data) batch = [data];
+    else {
+      if (hasAck) ack({ ok: false, reason: "invalid" });
+      return;
+    }
+    if (!isValidDrawBatch(batch)) {
+      if (hasAck) ack({ ok: false, reason: "invalid" });
+      return;
+    }
+    if (!checkUndoRateLimit(socket)) {
+      if (hasAck) ack({ ok: false, reason: "rateLimited", retryAfterMs: getUndoRetryAfterMs(socket) });
+      else socket.emit("rateLimited", { type: "undo", retryAfterMs: getUndoRetryAfterMs(socket) });
+      return;
+    }
+    const normalizedBatch = [];
+    for (const { x, y, color } of batch) {
+      const code = normalizeColor(color);
+      if (code === undefined) continue;
+      const key = `${x},${y}`;
+      if (code === ERASER_CODE) {
+        if (canvasData.has(key)) canvasData.delete(key);
+        pendingUpserts.delete(key);
+        pendingDeletes.add(key);
+      } else {
+        canvasData.set(key, code);
+        pendingDeletes.delete(key);
+        pendingUpserts.set(key, code);
+      }
+      normalizedBatch.push({ x, y, color: code });
+    }
+    if (!supabase && !pgPool) dirty = true;
+    if (normalizedBatch.length === 1) {
+      io.emit("draw", { x: normalizedBatch[0].x, y: normalizedBatch[0].y, color: normalizedBatch[0].color, totalPixels: canvasData.size });
+    } else {
+      io.emit("drawBatch", { pixels: normalizedBatch, totalPixels: canvasData.size });
+    }
+    if (hasAck) ack({ ok: true });
   });
 
   socket.on("disconnect", () => {
     socketDrawTimes.delete(socket.id);
     socketBatchTimes.delete(socket.id);
+    socketUndoTimes.delete(socket.id);
     console.log(`[disconnect] ${socket.id}`);
     io.emit("userCount", io.engine.clientsCount);
   });
