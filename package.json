@@ -7,7 +7,9 @@
   "scripts": {
     "start": "node server.js",
     "migrate": "node migrate-to-supabase.js",
-    "migrate-colors": "node migrate-colors-to-codes.js"
+    "migrate-colors": "node migrate-colors-to-codes.js",
+    "migrate-png": "node migrate-png-and-delta.js",
+    "png-worker": "node -e \"require('dotenv').config(); const w=require('./server/png-worker'); const {Pool}=require('pg'); const {createClient}=require('@supabase/supabase-js'); (async()=>{const m=process.env.SUPABASE_URL.match(/https:\\/\\/([^.]+)\\.supabase\\.co/); const pool=new Pool({host:'aws-0-ap-northeast-1.pooler.supabase.com',port:6543,database:'postgres',user:'postgres.'+m[1],password:process.env.SUPABASE_DB_PASSWORD,ssl:{rejectUnauthorized:false}}); const sup=createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY); const r=await w.processDirtyChunks(pool, sup, {limit:20}); console.log(r); await pool.end();})()\""
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.112.4",
@@ -15,6 +17,7 @@
     "dotenv": "^17.4.2",
     "express": "^4.19.2",
     "pg": "^8.12.0",
+    "sharp": "^0.35.4",
     "socket.io": "^4.7.5"
   }
 }

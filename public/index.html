@@ -15,7 +15,10 @@
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   html, body { width: 100%; height: 100%; overflow: hidden; background: #ffffff; font-family: system-ui, sans-serif; overscroll-behavior: none; }
-  #canvas { display: block; width: 100vw; height: 100vh; cursor: crosshair; }
+  #stage { position: fixed; inset: 0; will-change: transform; transform: translateZ(0); contain: layout paint style; }
+  #canvas, #gridCanvas { display: block; position: absolute; inset: 0; width: 100vw; height: 100vh; }
+  #canvas { cursor: crosshair; touch-action: none; -webkit-user-select: none; user-select: none; will-change: transform; }
+  #gridCanvas { pointer-events: none; touch-action: none; }
   #canvas.grabbing { cursor: grabbing; }
   #canvas.grab { cursor: grab; }
   #canvas.spoit { cursor: cell; }
@@ -94,7 +97,6 @@
   .colorBtn:hover { transform: scale(1.15); }
   .colorBtn.selected { border-color: #fff; box-shadow: 0 0 0 2px #000, 0 0 8px rgba(255,255,255,0.6); transform: scale(1.15); }
   #coords { color: #aaa; font-size: 11px; margin-left: 6px; }
-  #canvas { -webkit-user-select: none; user-select: none; touch-action: none; }
   #gridWarn {
     position: fixed; top: 80px; left: 50%; transform: translateX(-50%);
     background: rgba(200,40,40,0.92); color: #fff; padding: 6px 14px; border-radius: 8px;
@@ -124,7 +126,7 @@
 </head>
 <body>
 <div id="loading"><div class="spinner"></div><p id="loadingText">読み込み中...</p><small id="loadingSub">初回はサーバー起動に最大30秒かかることがあります</small></div>
-<canvas id="canvas"></canvas>
+<div id="stage"><canvas id="canvas"></canvas><canvas id="gridCanvas"></canvas></div>
 
 <div id="topbar">
   <div id="info">
@@ -148,7 +150,10 @@
 <script>
 (function() {
   const canvas = document.getElementById("canvas");
-  const ctx = canvas.getContext("2d");
+  const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
+  const gridCanvas = document.getElementById("gridCanvas");
+  const gridCtx = gridCanvas.getContext("2d", { alpha: true, desynchronized: true });
+  const stageEl = document.getElementById("stage");
   const paletteWrap = document.getElementById("paletteWrap");
   const toolBar = document.getElementById("toolBar");
   const gridWarn = document.getElementById("gridWarn");
@@ -242,14 +247,134 @@
   // ---- State ----
   let scale = 1; // initial 100%
   let offsetX = 0, offsetY = 0; // world coords at viewport center
+  // rAF集約: ハンドラでは target だけ更新し flush は rAF 内で行う (Phase1)
+  let targetOffsetX = 0, targetOffsetY = 0, targetScale = 1;
+  let hasPendingTransform = false;
+  function queueTransform(nx, ny, ns){
+    if(nx !== undefined){ targetOffsetX = nx; hasPendingTransform = true; }
+    if(ny !== undefined){ targetOffsetY = ny; hasPendingTransform = true; }
+    if(ns !== undefined){ targetScale = ns; hasPendingTransform = true; }
+  }
+  function flushPendingTransform(){
+    if(!hasPendingTransform) return false;
+    let changed = false;
+    if(targetOffsetX !== offsetX || targetOffsetY !== offsetY || targetScale !== scale){
+      offsetX = targetOffsetX; offsetY = targetOffsetY; scale = targetScale;
+      changed = true;
+    }
+    hasPendingTransform = false;
+    return changed;
+  }
+  // cached center for screenToWorld (avoid getBoundingClientRect per event)
+  let cachedCenter = { cx: 0, cy: 0 };
+  function updateCachedCenter(){
+    const rect = canvas.getBoundingClientRect();
+    cachedCenter.cx = rect.left + rect.width / 2;
+    cachedCenter.cy = rect.top + rect.height / 2;
+  }
   let selectedColor = COLORS[0];
   const pixels = new Map(); // gx -> Map<gy,color> (A: no string key)
   let pixelCount = 0;
   let worldPixelCount = 0;
   const tilePixels = new Map(); // tileKey -> Map<"x,y",color> for B: viewport culling via tiles
+  // Phase2: tile bitmap cache (OffscreenCanvas / HTMLCanvas per chunk)
+  const tileCanvasCache = new Map(); // key -> {canvas, ctx, dirty, lastUsed}
+  const MAX_TILE_CACHE_SIZE = 200;
   function tileKeyFor(x,y){ return `${Math.floor(x/TILE)},${Math.floor(y/TILE)}`; }
   function getPixel(x,y){ const col=pixels.get(x); return col ? col.get(y) : undefined; }
   function hasPixel(x,y){ const col=pixels.get(x); return col ? col.has(y) : false; }
+  function getOrCreateTileCache(key){
+    let entry = tileCanvasCache.get(key);
+    if(entry) return entry;
+    let c, cctx;
+    if(typeof OffscreenCanvas !== 'undefined'){
+      c = new OffscreenCanvas(TILE, TILE);
+      cctx = c.getContext('2d');
+    } else {
+      c = document.createElement('canvas');
+      c.width = TILE; c.height = TILE;
+      cctx = c.getContext('2d');
+    }
+    if(cctx) cctx.imageSmoothingEnabled = false;
+    entry = { canvas: c, ctx: cctx, bitmap: null, dirty: true, lastUsed: Date.now() };
+    tileCanvasCache.set(key, entry);
+    return entry;
+  }
+  function markTileDirtyByKey(key){
+    const e = tileCanvasCache.get(key);
+    if(e){
+      e.dirty = true;
+      if(e.bitmap){ try{ e.bitmap.close(); }catch(_){} e.bitmap = null; }
+    }
+    else {
+      // create lazily dirty so next render builds it
+      getOrCreateTileCache(key).dirty = true;
+    }
+  }
+  function evictTileCacheIfNeeded(){
+    if(tileCanvasCache.size <= MAX_TILE_CACHE_SIZE) return;
+    // LRU: sort by lastUsed
+    const entries = Array.from(tileCanvasCache.entries()).sort((a,b)=> a[1].lastUsed - b[1].lastUsed);
+    const toRemove = tileCanvasCache.size - MAX_TILE_CACHE_SIZE + 20; // remove batch
+    for(let i=0;i<toRemove;i++){
+      const ent = entries[i][1];
+      if(ent.bitmap) try{ ent.bitmap.close(); }catch(_){}
+      tileCanvasCache.delete(entries[i][0]);
+    }
+  }
+  function rebuildTileCanvas(key){
+    const entry = getOrCreateTileCache(key);
+    const cctx = entry.ctx;
+    if(!cctx) return;
+    // parse tx,ty from key
+    const comma = key.indexOf(',');
+    const tx = parseInt(key.slice(0, comma), 10);
+    const ty = parseInt(key.slice(comma+1), 10);
+    cctx.clearRect(0, 0, TILE, TILE);
+    const tmap = tilePixels.get(key);
+    if(!tmap || tmap.size===0){
+      entry.dirty = false;
+      entry.lastUsed = Date.now();
+      return;
+    }
+    // batch fillRect: group by color to reduce fillStyle churn
+    const byColor = new Map();
+    for(const [k,color] of tmap){
+      const c2 = byColor.get(color);
+      if(c2) c2.push(k);
+      else byColor.set(color, [k]);
+    }
+    for(const [color, keys] of byColor){
+      cctx.fillStyle = color;
+      for(const k of keys){
+        const comma2 = k.indexOf(',');
+        const gx = parseInt(k.slice(0, comma2), 10);
+        const gy = parseInt(k.slice(comma2+1), 10);
+        const lx = gx - tx * TILE;
+        const ly = gy - ty * TILE;
+        // 1x1 pixel per grid cell in tile canvas
+        cctx.fillRect(lx, ly, 1, 1);
+      }
+    }
+    entry.dirty = false;
+    entry.lastUsed = Date.now();
+    // Phase追加: createImageBitmap でGPU転送を高速化（非同期でキャッシュ）
+    if(typeof createImageBitmap !== 'undefined'){
+      const oldBmp = entry.bitmap;
+      const src = entry.canvas;
+      // OffscreenCanvas / HTMLCanvas どちらも createImageBitmap が使える（最新ブラウザ）
+      createImageBitmap(src).then(bmp=>{
+        // レース対策: エントリが差し替わったり再dirty化したら破棄
+        const cur = tileCanvasCache.get(key);
+        if(cur !== entry || entry.dirty){
+          try{ bmp.close(); }catch(_){}
+          return;
+        }
+        if(oldBmp) try{ oldBmp.close(); }catch(_){}
+        entry.bitmap = bmp;
+      }).catch(()=>{});
+    }
+  }
   function setPixel(x,y,color){
     const norm = color.toLowerCase();
     let col=pixels.get(x);
@@ -262,6 +387,7 @@
     let tmap=tilePixels.get(tk);
     if(!tmap){ tmap=new Map(); tilePixels.set(tk,tmap); }
     tmap.set(`${x},${y}`, norm);
+    markTileDirtyByKey(tk);
     // 同一セッションで再生成しない: ローカル生成タイルは即取得済み扱い
     if(!fetchedTiles.has(tk) && !fetchingTiles.has(tk)) fetchedTiles.add(tk);
     return true;
@@ -275,9 +401,13 @@
     const tk=tileKeyFor(x,y);
     const tmap=tilePixels.get(tk);
     if(tmap){ tmap.delete(`${x},${y}`); if(tmap.size===0) tilePixels.delete(tk); }
+    markTileDirtyByKey(tk);
     return true;
   }
-  function clearPixels(){ pixels.clear(); tilePixels.clear(); pixelCount=0; }
+  function clearPixels(){
+    for(const ent of tileCanvasCache.values()){ if(ent.bitmap) try{ ent.bitmap.close(); }catch(_){} }
+    pixels.clear(); tilePixels.clear(); tileCanvasCache.clear(); pixelCount=0;
+  }
   let currentTool = TOOLS.DOT;
   let spoitPrevTool = null; // tool to return to after picking color with SPoit
   let shapeFilled = false; // for rect/circle: false=枠線, true=塗りつぶし
@@ -540,7 +670,8 @@
   // ---- Helpers ----
   function getEffectivePixelSize(){
     const dpr = window.devicePixelRatio || 1;
-    const physicalPixelSize = PIXEL_SIZE * scale * dpr;
+    const sc = hasPendingTransform ? targetScale : scale;
+    const physicalPixelSize = PIXEL_SIZE * sc * dpr;
     return physicalPixelSize / dpr;
   }
   
@@ -548,15 +679,18 @@
     const dpr = window.devicePixelRatio || 1;
     const cssW = canvas.width / dpr;
     const cssH = canvas.height / dpr;
+    const sc = hasPendingTransform ? targetScale : scale;
+    const ox = hasPendingTransform ? targetOffsetX : offsetX;
+    const oy = hasPendingTransform ? targetOffsetY : offsetY;
 
-    const halfW = (cssW / 2) / scale;
-    const halfH = (cssH / 2) / scale;
+    const halfW = (cssW / 2) / sc;
+    const halfH = (cssH / 2) / sc;
 
     return {
-      minWorldX: offsetX - halfW,
-      maxWorldX: offsetX + halfW,
-      minWorldY: offsetY - halfH,
-      maxWorldY: offsetY + halfH,
+      minWorldX: ox - halfW,
+      maxWorldX: ox + halfW,
+      minWorldY: oy - halfH,
+      maxWorldY: oy + halfH,
       worldW: halfW * 2,
       worldH: halfH * 2
     };
@@ -768,11 +902,16 @@
   function scheduleRender(){
     if(renderQueued) return;
     renderQueued = true;
-    requestAnimationFrame(()=>{ renderQueued=false; render(); });
+    requestAnimationFrame(()=>{ renderQueued=false; flushPendingTransform(); render(); });
   }
 
   // ---- Viewport fetch (tile-based) ----
+  // Phase1: render用はソート無しで高速、fetch用はcenter-firstソートを維持
   function getTilesForViewport(){
+    // fast path for render (no sort)
+    return getTilesForViewportFast();
+  }
+  function getTilesForViewportFast(){
     const vb = getViewportBounds();
     const padGrid = 2;
     const minGridX = Math.floor(vb.minWorldX / PIXEL_SIZE) - padGrid;
@@ -780,16 +919,31 @@
     const minGridY = Math.floor(vb.minWorldY / PIXEL_SIZE) - padGrid;
     const maxGridY = Math.floor(vb.maxWorldY / PIXEL_SIZE) + padGrid;
     let spanX = maxGridX - minGridX + 1, spanY = maxGridY - minGridY + 1;
-    // if viewport too large, clamp to center 500x500 (5 tiles)
     if(spanX > 500 || spanY > 500){
       const cx = Math.floor((minGridX+maxGridX)/2);
       const cy = Math.floor((minGridY+maxGridY)/2);
       const half = 250;
-      return getTilesForBounds(cx-half, cy-half, cx+half-1, cy+half-1);
+      return getTilesForBounds(cx-half, cy-half, cx+half-1, cy+half-1, false);
     }
-    return getTilesForBounds(minGridX, minGridY, maxGridX, maxGridY);
+    return getTilesForBounds(minGridX, minGridY, maxGridX, maxGridY, false);
   }
-  function getTilesForBounds(minX, minY, maxX, maxY){
+  function getTilesForViewportSorted(){
+    const vb = getViewportBounds();
+    const padGrid = 2;
+    const minGridX = Math.floor(vb.minWorldX / PIXEL_SIZE) - padGrid;
+    const maxGridX = Math.floor(vb.maxWorldX / PIXEL_SIZE) + padGrid;
+    const minGridY = Math.floor(vb.minWorldY / PIXEL_SIZE) - padGrid;
+    const maxGridY = Math.floor(vb.maxWorldY / PIXEL_SIZE) + padGrid;
+    let spanX = maxGridX - minGridX + 1, spanY = maxGridY - minGridY + 1;
+    if(spanX > 500 || spanY > 500){
+      const cx = Math.floor((minGridX+maxGridX)/2);
+      const cy = Math.floor((minGridY+maxGridY)/2);
+      const half = 250;
+      return getTilesForBounds(cx-half, cy-half, cx+half-1, cy+half-1, true);
+    }
+    return getTilesForBounds(minGridX, minGridY, maxGridX, maxGridY, true);
+  }
+  function getTilesForBounds(minX, minY, maxX, maxY, sorted){
     const tiles = [];
     const tx0 = Math.floor(minX / TILE), ty0 = Math.floor(minY / TILE);
     const tx1 = Math.floor(maxX / TILE), ty1 = Math.floor(maxY / TILE);
@@ -798,14 +952,14 @@
         tiles.push({tx,ty, x0: tx*TILE, y0: ty*TILE, x1: tx*TILE+TILE-1, y1: ty*TILE+TILE-1, key: `${tx},${ty}`});
       }
     }
-    // center-first: sort by distance to viewport center
-    const vb = getViewportBounds();
-    const cx = Math.floor(offsetX/PIXEL_SIZE), cy = Math.floor(offsetY/PIXEL_SIZE);
-    tiles.sort((a,b)=>{
-      const da = Math.hypot(a.tx*TILE+TILE/2 - cx, a.ty*TILE+TILE/2 - cy);
-      const db = Math.hypot(b.tx*TILE+TILE/2 - cx, b.ty*TILE+TILE/2 - cy);
-      return da-db;
-    });
+    if(sorted){
+      const cx = Math.floor(offsetX/PIXEL_SIZE), cy = Math.floor(offsetY/PIXEL_SIZE);
+      tiles.sort((a,b)=>{
+        const da = Math.hypot(a.tx*TILE+TILE/2 - cx, a.ty*TILE+TILE/2 - cy);
+        const db = Math.hypot(b.tx*TILE+TILE/2 - cx, b.ty*TILE+TILE/2 - cy);
+        return da-db;
+      });
+    }
     return tiles;
   }
   function getGridBoundsForFetch(){
@@ -827,9 +981,21 @@
       const cx = tile.tx;
       const cy = tile.ty;
       const url = `/api/chunks?cx=${cx}&cy=${cy}`;
-      const res = await fetch(url, { cache: "no-store" });
+      let res = await fetch(url, { cache: "default" });
+      if(res.status === 304){
+        // Not modified — try to get from Cache API (SW) or force reload for body
+        if(res.headers.get("ETag") && res.headers.get("ETag").includes("empty")){
+          fetchedTiles.add(key);
+          return 0;
+        }
+        // For SW CacheFirst, 304 should be rare; attempt reload to get body
+        try{
+          const retry = await fetch(url, { cache: "reload" });
+          if(retry.ok) res = retry;
+          else { fetchedTiles.add(key); return 0; }
+        } catch(_){ fetchedTiles.add(key); return 0; }
+      }
       if(res.status === 404){
-        // No chunk for this tile — empty, mark as fetched
         fetchedTiles.add(key);
         return 0;
       }
@@ -870,7 +1036,7 @@
       updateOfflineLoading();
       return;
     }
-    const tiles = getTilesForViewport();
+    const tiles = getTilesForViewportSorted();
     // 同一セッションで再生成しない: 未取得のみを対象にし、sliceはその後に適用
     const unfetched = tiles.filter(t=> !fetchedTiles.has(t.key) && !fetchingTiles.has(t.key));
     if(unfetched.length===0){
@@ -900,6 +1066,9 @@
     }
     if(unfetched.length > MAX_TILES_PER_FETCH){
       setTimeout(()=> fetchViewport(false), 200);
+    } else {
+      // 全タイル取得後にアイドル先読みをスケジュール
+      scheduleIdlePrefetch();
     }
   }
   let lastFetchAt = 0;
@@ -923,20 +1092,87 @@
     fetchViewport(false);
   }
 
+  // ---- Idle Prefetch (requestIdleCallback): 視界外の隣接タイルを先読み ----
+  function getPrefetchCandidates(){
+    const vp = getTilesForViewportSorted();
+    if(vp.length===0) return [];
+    const current = new Set(vp.map(t=>t.key));
+    const minTx = Math.min(...vp.map(t=>t.tx)) - 1;
+    const maxTx = Math.max(...vp.map(t=>t.tx)) + 1;
+    const minTy = Math.min(...vp.map(t=>t.ty)) - 1;
+    const maxTy = Math.max(...vp.map(t=>t.ty)) + 1;
+    const extra = [];
+    for(let tx=minTx; tx<=maxTx; tx++){
+      for(let ty=minTy; ty<=maxTy; ty++){
+        const k = `${tx},${ty}`;
+        if(current.has(k)) continue;
+        if(fetchedTiles.has(k) || fetchingTiles.has(k)) continue;
+        extra.push({tx, ty, key:k, x0: tx*TILE, y0: ty*TILE, x1: tx*TILE+TILE-1, y1: ty*TILE+TILE-1});
+      }
+    }
+    // 中心に近い順
+    const cx = Math.floor((hasPendingTransform?targetOffsetX:offsetX)/PIXEL_SIZE);
+    const cy = Math.floor((hasPendingTransform?targetOffsetY:offsetY)/PIXEL_SIZE);
+    extra.sort((a,b)=>{
+      const da = Math.hypot(a.tx*TILE+TILE/2 - cx, a.ty*TILE+TILE/2 - cy);
+      const db = Math.hypot(b.tx*TILE+TILE/2 - cx, b.ty*TILE+TILE/2 - cy);
+      return da-db;
+    });
+    return extra.slice(0, 8);
+  }
+  let idlePrefetchScheduled = false;
+  function scheduleIdlePrefetch(){
+    if(idlePrefetchScheduled) return;
+    if(!initialLoaded) return;
+    if(isPanning || isDotPanning || wasPinch) return;
+    idlePrefetchScheduled = true;
+    const run = (deadline)=>{
+      idlePrefetchScheduled = false;
+      if(isPanning || isDotPanning || wasPinch || touchMode) return;
+      if(fetchingTiles.size >= 4) return; // 混雑時は見送り
+      const cands = getPrefetchCandidates();
+      if(cands.length===0) return;
+      const budget = deadline && typeof deadline.timeRemaining==='function' ? deadline.timeRemaining() : 12;
+      const count = budget > 20 ? 4 : budget > 8 ? 2 : 1;
+      const toFetch = cands.slice(0, count);
+      toFetch.forEach(t=> fetchTile(t).then(n=>{ if(n>0) scheduleRender(); }));
+      if(cands.length > count){
+        // 残りは次のアイドルで
+        scheduleIdlePrefetch();
+      }
+    };
+    if(typeof requestIdleCallback !== 'undefined'){
+      requestIdleCallback(run, { timeout: 2000 });
+    } else {
+      setTimeout(()=> run({ timeRemaining: ()=> 8 }), 400);
+    }
+  }
+
   // ---- Canvas sizing (HiDPI) ----
   function resize() {
     const dpr = window.devicePixelRatio || 1;
-    canvas.width = Math.round(window.innerWidth * dpr);
-    canvas.height = Math.round(window.innerHeight * dpr);
+    const w = Math.round(window.innerWidth * dpr);
+    const h = Math.round(window.innerHeight * dpr);
+    canvas.width = w;
+    canvas.height = h;
+    gridCanvas.width = w;
+    gridCanvas.height = h;
     canvas.style.width = window.innerWidth + "px";
     canvas.style.height = window.innerHeight + "px";
+    gridCanvas.style.width = window.innerWidth + "px";
+    gridCanvas.style.height = window.innerHeight + "px";
+    updateCachedCenter();
+    // initialize target to current
+    targetOffsetX = offsetX; targetOffsetY = offsetY; targetScale = scale;
     scheduleRender();
     if(initialLoaded) scheduleViewportFetch();
   }
   window.addEventListener("resize", resize);
+  window.addEventListener("orientationchange", ()=> setTimeout(()=>{ updateCachedCenter(); scheduleRender(); }, 100));
   // defer initial resize/fetch until layout is ready
-  requestAnimationFrame(()=>{ resize(); });
+  requestAnimationFrame(()=>{ resize(); updateCachedCenter(); });
   resize();
+  updateCachedCenter();
 
   window.addEventListener("mousemove", (e)=>{
     if(e.movementX!==0 || e.movementY!==0) lastMouseTime=Date.now();
@@ -947,26 +1183,29 @@
 
   // ---- Coordinate transforms ----
   function getCanvasCenter(){
-    const rect = canvas.getBoundingClientRect();
-    return {
-      cx: rect.left + rect.width / 2,
-      cy: rect.top + rect.height / 2
-    };
+    return cachedCenter;
   }
   function screenToWorld(sx, sy) {
-    const center = getCanvasCenter();
+    const center = cachedCenter;
     const dx = sx - center.cx;
     const dy = sy - center.cy;
+    // use target during pan coalescing to avoid lag (if pending, use target)
+    const ox = hasPendingTransform ? targetOffsetX : offsetX;
+    const oy = hasPendingTransform ? targetOffsetY : offsetY;
+    const sc = hasPendingTransform ? targetScale : scale;
     return {
-      x: offsetX + dx / scale,
-      y: offsetY + dy / scale
+      x: ox + dx / sc,
+      y: oy + dy / sc
     };
   }
   function worldToScreen(wx, wy) {
-    const center = getCanvasCenter();
+    const center = cachedCenter;
+    const ox = hasPendingTransform ? targetOffsetX : offsetX;
+    const oy = hasPendingTransform ? targetOffsetY : offsetY;
+    const sc = hasPendingTransform ? targetScale : scale;
     return {
-      x: (wx - offsetX) * scale + center.cx,
-      y: (wy - offsetY) * scale + center.cy
+      x: (wx - ox) * sc + center.cx,
+      y: (wy - oy) * sc + center.cy
     };
   }
   function worldToGrid(wx, wy) {
@@ -1200,8 +1439,9 @@
     return result;
   }
 
-  // ---- Rendering with Culling ----
+  // ---- Rendering with Tile Cache (Phase2) + Grid Layer Separation ----
   function render() {
+    flushPendingTransform();
     const dpr = window.devicePixelRatio || 1;
     const w = canvas.width / dpr;
     const h = canvas.height / dpr;
@@ -1211,12 +1451,19 @@
     ctx.clearRect(0, 0, w, h);
     ctx.fillStyle = "#ffffff";
     ctx.fillRect(0, 0, w, h);
+    gridCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    gridCtx.clearRect(0, 0, w, h);
 
     ctx.save();
+    gridCtx.save();
     ctx.translate(w / 2, h / 2);
     ctx.scale(scale, scale);
     ctx.translate(-offsetX, -offsetY);
+    gridCtx.translate(w / 2, h / 2);
+    gridCtx.scale(scale, scale);
+    gridCtx.translate(-offsetX, -offsetY);
     ctx.imageSmoothingEnabled = false;
+    gridCtx.imageSmoothingEnabled = false;
 
     const vb = getViewportBounds();
     const minWorldX = vb.minWorldX, maxWorldX = vb.maxWorldX;
@@ -1228,54 +1475,56 @@
     const maxGridY = Math.floor(maxWorldY / PIXEL_SIZE) + 1;
 
     const canDrawGrid = isGridVisible();
-    // ピクセル間にオーバーラップを設けてグリッド線を隠す（ズーム時のみグリッド描画）
     const pad = 0.6 / scale;
 
-    // グリッド描画（不透明度倍率を指定）: ピクセル前は通常不透明度、ピクセル上は低不透明度
-    const drawGrid = (alphaMult) => {
+    // グリッド描画は分離レイヤー(gridCanvas)に描画 — タイル描画と分離してパン時の再描画コストを削減
+    const drawGrid = (targetCtx, alphaMult) => {
       if (!canDrawGrid) return;
-      // ズームレベルに関わらず一定の不透明度
       const gridA = 0.05 * alphaMult;
       const axisA = Math.min(0.30, gridA * 1.8);
-      ctx.strokeStyle = `rgba(0,0,0,${gridA.toFixed(3)})`;
-      ctx.lineWidth = 1 / scale;
-      ctx.beginPath();
+      targetCtx.strokeStyle = `rgba(0,0,0,${gridA.toFixed(3)})`;
+      targetCtx.lineWidth = 1 / scale;
+      targetCtx.beginPath();
       for (let gx = minGridX; gx <= maxGridX; gx++) {
         const wx = gx * PIXEL_SIZE;
-        ctx.moveTo(wx, minWorldY);
-        ctx.lineTo(wx, maxWorldY);
+        targetCtx.moveTo(wx, minWorldY);
+        targetCtx.lineTo(wx, maxWorldY);
       }
       for (let gy = minGridY; gy <= maxGridY; gy++) {
         const wy = gy * PIXEL_SIZE;
-        ctx.moveTo(minWorldX, wy);
-        ctx.lineTo(maxWorldX, wy);
+        targetCtx.moveTo(minWorldX, wy);
+        targetCtx.lineTo(maxWorldX, wy);
       }
-      ctx.stroke();
-      ctx.strokeStyle = `rgba(0,0,0,${axisA.toFixed(3)})`;
-      ctx.lineWidth = 1.5 / scale;
-      ctx.beginPath();
-      ctx.moveTo(0, minWorldY); ctx.lineTo(0, maxWorldY);
-      ctx.moveTo(minWorldX, 0); ctx.lineTo(maxWorldX, 0);
-      ctx.stroke();
+      targetCtx.stroke();
+      targetCtx.strokeStyle = `rgba(0,0,0,${axisA.toFixed(3)})`;
+      targetCtx.lineWidth = 1.5 / scale;
+      targetCtx.beginPath();
+      targetCtx.moveTo(0, minWorldY); targetCtx.lineTo(0, maxWorldY);
+      targetCtx.moveTo(minWorldX, 0); targetCtx.lineTo(maxWorldX, 0);
+      targetCtx.stroke();
     };
 
-    // Viewport Culling (B) + A: no per-cell string key — iterate only rendered pixels in viewport tiles
-    const vpTiles = getTilesForViewport();
+    // Viewport Culling + Tile Bitmap Cache (OffscreenCanvas per chunk) — 1 drawImage per tile
+    const vpTiles = getTilesForViewportFast();
+    if(tileCanvasCache.size > MAX_TILE_CACHE_SIZE) evictTileCacheIfNeeded();
     for(const tile of vpTiles){
       const tmap = tilePixels.get(tile.key);
-      if(!tmap) continue;
-      for(const [k,color] of tmap){
-        const comma = k.indexOf(',');
-        const x = parseInt(k.slice(0, comma), 10);
-        const y = parseInt(k.slice(comma+1), 10);
-        if(x < minGridX || x > maxGridX || y < minGridY || y > maxGridY) continue;
-        ctx.fillStyle = color;
-        ctx.fillRect(x * PIXEL_SIZE, y * PIXEL_SIZE, PIXEL_SIZE + pad, PIXEL_SIZE + pad);
+      if(!tmap || tmap.size===0) continue;
+      let entry = tileCanvasCache.get(tile.key);
+      if(!entry || entry.dirty){
+        rebuildTileCanvas(tile.key);
+        entry = tileCanvasCache.get(tile.key);
       }
+      if(!entry || (!entry.canvas && !entry.bitmap)) continue;
+      entry.lastUsed = Date.now();
+      // tile canvas is TILE x TILE (1px per grid cell), draw scaled to world size
+      ctx.imageSmoothingEnabled = false;
+      const src = entry.bitmap || entry.canvas;
+      ctx.drawImage(src, tile.x0 * PIXEL_SIZE, tile.y0 * PIXEL_SIZE, TILE * PIXEL_SIZE, TILE * PIXEL_SIZE);
     }
 
-    // グリッドをピクセルの上で再描画（色ピクセル上に見えるグリッド）
-    drawGrid(3.0);
+    // グリッドは分離レイヤーに描画（ピクセル上に見えるグリッド）
+    drawGrid(gridCtx, 3.0);
 
     if(isDrawing && drawStartGrid && drawCurrentGrid){
       if(currentTool===TOOLS.RECT || currentTool===TOOLS.CIRCLE || currentTool===TOOLS.LINE){
@@ -1401,6 +1650,9 @@
     }
 
     ctx.restore();
+    gridCtx.restore();
+    // アイドル時の先読みをスケジュール（パン停止後に隣接タイルをプリフェッチ）
+    if(initialLoaded) scheduleIdlePrefetch();
   }
 
   function updateInfo() {
@@ -1554,10 +1806,12 @@
       }
     }
     if (e.key === "+" || e.key === "=") {
-      scale = Math.min(MAX_SCALE, scale * 1.2);
+      const cur = hasPendingTransform ? targetScale : scale;
+      queueTransform(undefined, undefined, Math.min(MAX_SCALE, cur * 1.2));
       scheduleRender(); updateInfo(); updateToolUI();
     } else if (e.key === "-" || e.key === "_") {
-      scale = Math.max(MIN_SCALE, scale / 1.2);
+      const cur = hasPendingTransform ? targetScale : scale;
+      queueTransform(undefined, undefined, Math.max(MIN_SCALE, cur / 1.2));
       scheduleRender(); updateInfo(); updateToolUI();
     }
   });
@@ -1575,7 +1829,9 @@
     if(e.button===1){
       isPanning = true;
       panStartScreen = { x: e.clientX, y: e.clientY };
-      panStartOffset = { x: offsetX, y: offsetY };
+      const cx = hasPendingTransform ? targetOffsetX : offsetX;
+      const cy = hasPendingTransform ? targetOffsetY : offsetY;
+      panStartOffset = { x: cx, y: cy };
       canvas.classList.add("grabbing");
       triggerViewportFetchImmediate();
       e.preventDefault();
@@ -1599,15 +1855,17 @@
         }
         return;
       }
-     if(currentTool===TOOLS.DOT){
-      isDotPanning = true;
-      dotHasMoved = false;
-      dotPanStartScreen = { x: e.clientX, y: e.clientY };
-      dotPanStartOffset = { x: offsetX, y: offsetY };
-      hoverGrid = grid;
-      canvas.classList.add("grabbing");
-      return;
-    }
+      if(currentTool===TOOLS.DOT){
+       isDotPanning = true;
+       dotHasMoved = false;
+       dotPanStartScreen = { x: e.clientX, y: e.clientY };
+       const cx = hasPendingTransform ? targetOffsetX : offsetX;
+       const cy = hasPendingTransform ? targetOffsetY : offsetY;
+       dotPanStartOffset = { x: cx, y: cy };
+       hoverGrid = grid;
+       canvas.classList.add("grabbing");
+       return;
+     }
     if(!isToolAllowed(currentTool)){
       showGridWarn();
       isEraserStroke = false;
@@ -1643,27 +1901,30 @@
   });
 
   canvas.addEventListener("mousemove", (e) => {
-    const world = screenToWorld(e.clientX, e.clientY);
+    // Phase1: coalesce pointer eventsで遅延低減
+    const events = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
+    const last = events[events.length - 1];
+    const world = screenToWorld(last.clientX, last.clientY);
     const grid = worldToGrid(world.x, world.y);
     hoverGrid = grid;
     coordEl.textContent = `${grid.x}, ${-grid.y}`;
 
     if(isDotPanning){
-      const dx = e.clientX - dotPanStartScreen.x;
-      const dy = e.clientY - dotPanStartScreen.y;
+      const dx = last.clientX - dotPanStartScreen.x;
+      const dy = last.clientY - dotPanStartScreen.y;
       if(Math.hypot(dx,dy) > DOT_DRAG_THRESHOLD) dotHasMoved = true;
-      offsetX = dotPanStartOffset.x - dx / scale;
-      offsetY = dotPanStartOffset.y - dy / scale;
+      const sc = hasPendingTransform ? targetScale : scale;
+      queueTransform(dotPanStartOffset.x - dx / sc, dotPanStartOffset.y - dy / sc, undefined);
       scheduleRender(); updateInfo();
       scheduleViewportFetchThrottled();
       return;
     }
 
     if(isPanning){
-      const dx = e.clientX - panStartScreen.x;
-      const dy = e.clientY - panStartScreen.y;
-      offsetX = panStartOffset.x - dx / scale;
-      offsetY = panStartOffset.y - dy / scale;
+      const dx = last.clientX - panStartScreen.x;
+      const dy = last.clientY - panStartScreen.y;
+      const sc = hasPendingTransform ? targetScale : scale;
+      queueTransform(panStartOffset.x - dx / sc, panStartOffset.y - dy / sc, undefined);
       scheduleRender(); updateInfo();
       scheduleViewportFetchThrottled();
       return;
@@ -1800,13 +2061,18 @@
     if(e.ctrlKey){
       const delta = -e.deltaY;
       const factor = Math.exp(delta * 0.008);
-      const newScale = Math.min(MAX_SCALE, Math.max(MIN_SCALE, scale * factor));
-      if (newScale === scale) return;
-      const before = screenToWorld(e.clientX, e.clientY);
-      scale = newScale;
-      const after = screenToWorld(e.clientX, e.clientY);
-      offsetX += before.x - after.x;
-      offsetY += before.y - after.y;
+      const curScale = hasPendingTransform ? targetScale : scale;
+      const curOffsetX = hasPendingTransform ? targetOffsetX : offsetX;
+      const curOffsetY = hasPendingTransform ? targetOffsetY : offsetY;
+      const newScale = Math.min(MAX_SCALE, Math.max(MIN_SCALE, curScale * factor));
+      if (newScale === curScale) return;
+      // 一時的に scale を更新して before/after を計算するため target を使用
+      const center = cachedCenter;
+      const beforeX = curOffsetX + (e.clientX - center.cx) / curScale;
+      const beforeY = curOffsetY + (e.clientY - center.cy) / curScale;
+      const afterX = curOffsetX + (e.clientX - center.cx) / newScale;
+      const afterY = curOffsetY + (e.clientY - center.cy) / newScale;
+      queueTransform(curOffsetX + beforeX - afterX, curOffsetY + beforeY - afterY, newScale);
       scheduleRender(); updateInfo(); updateToolUI();
       scheduleViewportFetchThrottled();
       return;
@@ -1817,8 +2083,10 @@
       if(absX < 70 && absY < 70) lastTrackpadTime = Date.now();
       else lastMouseTime = Date.now();
     }
-    offsetX += e.deltaX / scale;
-    offsetY += e.deltaY / scale;
+    const curScale = hasPendingTransform ? targetScale : scale;
+    const curX = hasPendingTransform ? targetOffsetX : offsetX;
+    const curY = hasPendingTransform ? targetOffsetY : offsetY;
+    queueTransform(curX + e.deltaX / curScale, curY + e.deltaY / curScale, undefined);
     scheduleRender(); updateInfo();
     scheduleViewportFetchThrottled();
   }, { passive: false });
@@ -1836,7 +2104,9 @@
         isDotPanning = true;
         dotHasMoved = false;
         dotPanStartScreen = { x: t.clientX, y: t.clientY };
-        dotPanStartOffset = { x: offsetX, y: offsetY };
+        const cx = hasPendingTransform ? targetOffsetX : offsetX;
+        const cy = hasPendingTransform ? targetOffsetY : offsetY;
+        dotPanStartOffset = { x: cx, y: cy };
         touchMode='dotPan';
       } else if(currentTool===TOOLS.SPoit){
         const col = getPixel(grid.x,grid.y) || ERASER_COLOR;
@@ -1904,8 +2174,8 @@
       const dx=t.clientX - dotPanStartScreen.x;
       const dy=t.clientY - dotPanStartScreen.y;
       if(Math.hypot(dx,dy) > DOT_DRAG_THRESHOLD) dotHasMoved=true;
-      offsetX = dotPanStartOffset.x - dx / scale;
-      offsetY = dotPanStartOffset.y - dy / scale;
+      const sc = hasPendingTransform ? targetScale : scale;
+      queueTransform(dotPanStartOffset.x - dx / sc, dotPanStartOffset.y - dy / sc, undefined);
       scheduleRender(); updateInfo();
       scheduleViewportFetchThrottled();
       return;
@@ -1951,25 +2221,29 @@
       const dx=e.touches[0].clientX-e.touches[1].clientX;
       const dy=e.touches[0].clientY-e.touches[1].clientY;
       const dist=Math.hypot(dx,dy);
+      let curScale = hasPendingTransform ? targetScale : scale;
+      let curX = hasPendingTransform ? targetOffsetX : offsetX;
+      let curY = hasPendingTransform ? targetOffsetY : offsetY;
       if(lastTouchDist){
         const factor=dist/lastTouchDist;
         if(Math.abs(factor-1) > 0.002){
-          const newScale=Math.min(MAX_SCALE, Math.max(MIN_SCALE, scale*factor));
-          const before=screenToWorld(cx,cy);
-          scale=newScale;
-          const after=screenToWorld(cx,cy);
-          offsetX += before.x - after.x;
-          offsetY += before.y - after.y;
+          const newScale=Math.min(MAX_SCALE, Math.max(MIN_SCALE, curScale*factor));
+          const before = { x: curX + (cx - cachedCenter.cx) / curScale, y: curY + (cy - cachedCenter.cy) / curScale };
+          const after = { x: curX + (cx - cachedCenter.cx) / newScale, y: curY + (cy - cachedCenter.cy) / newScale };
+          curX += before.x - after.x;
+          curY += before.y - after.y;
+          curScale = newScale;
         }
       }
       if(lastTouchCenter){
         const ddx=cx - lastTouchCenter.x;
         const ddy=cy - lastTouchCenter.y;
         if(ddx!==0 || ddy!==0){
-          offsetX -= ddx / scale;
-          offsetY -= ddy / scale;
+          curX -= ddx / curScale;
+          curY -= ddy / curScale;
         }
       }
+      queueTransform(curX, curY, curScale);
       lastTouchDist=dist;
       lastTouchCenter={x:cx,y:cy};
       scheduleRender(); updateInfo(); updateToolUI();

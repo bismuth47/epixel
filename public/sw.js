@@ -1,5 +1,6 @@
-// epixel Service Worker — App Shell CacheFirst, API NetworkOnly/NetworkFirst
+// epixel Service Worker — App Shell CacheFirst, API chunks CacheFirst (Phase4), other API NetworkFirst
 const CACHE_NAME = "epixel-shell-v1";
+const CHUNK_CACHE_NAME = "epixel-chunks-v1";
 const SHELL_URLS = [
   "/",
   "/manifest.json",
@@ -18,7 +19,7 @@ self.addEventListener("install", (event) => {
 self.addEventListener("activate", (event) => {
   event.waitUntil(
     caches.keys().then((keys) =>
-      Promise.all(keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k)))
+      Promise.all(keys.filter((k) => k !== CACHE_NAME && k !== CHUNK_CACHE_NAME).map((k) => caches.delete(k)))
     ).then(() => self.clients.claim())
   );
 });
@@ -34,7 +35,37 @@ self.addEventListener("fetch", (event) => {
   // Never cache WebSocket / socket.io polling
   if (url.pathname.startsWith("/socket.io/")) return;
 
-  // API / health : NetworkFirst (offline時はキャンバスに入れない仕様なのでフォールバック不要だが、SWが無いと404になるのを防ぐ)
+  // Chunks: CacheFirst with StaleWhileRevalidate (Phase4) — ETag revalidation handled by browser
+  if (url.pathname === "/api/chunks") {
+    event.respondWith(
+      caches.open(CHUNK_CACHE_NAME).then((cache) =>
+        cache.match(req).then((cached) => {
+          const fetchAndCache = fetch(req)
+            .then((res) => {
+              if (res && res.ok) {
+                cache.put(req, res.clone());
+              } else if (res && res.status === 304 && cached) {
+                return cached;
+              }
+              // also cache 404 empty as negative cache for 10s via Cache-Control but store to avoid flood
+              // do not cache 404 in SW to avoid stale empties — let server handle
+              return res;
+            })
+            .catch(() => cached || null);
+          // CacheFirst: return cached immediately, revalidate in background
+          if (cached) {
+            // background revalidate
+            fetchAndCache.catch(()=>{});
+            return cached;
+          }
+          return fetchAndCache;
+        })
+      )
+    );
+    return;
+  }
+
+  // Other API / health : NetworkFirst
   if (
     url.pathname.startsWith("/api/") ||
     url.pathname === "/health"

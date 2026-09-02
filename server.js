@@ -7,6 +7,8 @@ const compression = require("compression");
 const { createClient } = require("@supabase/supabase-js");
 const { Pool } = require("pg");
 const ChunkCodec = require("./shared/chunk-codec");
+let pngWorker = null;
+try { pngWorker = require("./server/png-worker"); } catch (e) { console.warn("[png-worker] not loaded:", e.message); }
 
 try { require("dotenv").config(); } catch (e) {}
 
@@ -20,7 +22,11 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const SUPABASE_DB_PASSWORD = process.env.SUPABASE_DB_PASSWORD;
 const SUPABASE_TABLE = process.env.SUPABASE_TABLE || "canvas_pixels";
 const CHUNK_TABLE = "canvas_chunks";
+const DELTA_TABLE = "canvas_pixel_deltas";
 const CHUNK_SIZE = ChunkCodec.CHUNK_SIZE;
+const PNG_BUCKET = (pngWorker && pngWorker.BUCKET) || "chunk-pngs";
+const PNG_CRON_MS = 60 * 1000;
+const PNG_MAX_PER_TICK = (pngWorker && pngWorker.MAX_CHUNKS_PER_TICK) || 20;
 
 // Direct PostgreSQL pool (fallback when Supabase REST API key is invalid)
 let pgPool = null;
@@ -465,6 +471,8 @@ async function saveChunkToSupabase(cx, cy, upserts, deletes) {
           [cx, cy]
         );
       }
+      // Delta: record deletions as eraser (255) for overlay correction
+      await recordDeltas(cx, cy, deletes, upserts, true, client);
     } else {
       const encoded = ChunkCodec.encode(pixels);
       if (supabase) {
@@ -482,6 +490,7 @@ async function saveChunkToSupabase(cx, cy, upserts, deletes) {
           console.error(`[save] chunk ${cx},${cy} upsert error:`, upsertErr.message);
           return false;
         }
+        // Also ensure updated_at is bumped for png dirty detection (supabase path does it)
       } else if (pgPool) {
         const buf = bufferToHex(encoded);
         await client.query(
@@ -490,6 +499,8 @@ async function saveChunkToSupabase(cx, cy, upserts, deletes) {
           [cx, cy, buf, pixels.length]
         );
       }
+      // Delta: record upserts + deletes
+      await recordDeltas(cx, cy, deletes, upserts, false, client);
     }
 
     return true;
@@ -498,6 +509,67 @@ async function saveChunkToSupabase(cx, cy, upserts, deletes) {
     return false;
   } finally {
     if (client) client.release();
+  }
+}
+
+// Record delta rows for PNG overlay (best-effort, failures don't fail the chunk save)
+async function recordDeltas(cx, cy, deletes, upserts, isDeleteAll, pgClient) {
+  try {
+    const rows = [];
+    if (deletes && deletes.size > 0) {
+      for (const localIdx of deletes) {
+        const xy = ChunkCodec.getXY(localIdx);
+        const gx = cx * CHUNK_SIZE + xy.x;
+        const gy = cy * CHUNK_SIZE + xy.y;
+        rows.push({ chunk_x: cx, chunk_y: cy, x: gx, y: gy, color: 255 });
+      }
+    }
+    if (upserts && upserts.size > 0) {
+      for (const [localIdx, colorId] of upserts) {
+        const xy = ChunkCodec.getXY(localIdx);
+        const gx = cx * CHUNK_SIZE + xy.x;
+        const gy = cy * CHUNK_SIZE + xy.y;
+        rows.push({ chunk_x: cx, chunk_y: cy, x: gx, y: gy, color: colorId });
+      }
+    }
+    if (rows.length === 0) return;
+
+    // Prefer pgPool direct insert (works even when supabase JS is primary)
+    if (pgPool) {
+      const client = pgClient || await pgPool.connect();
+      const needRelease = !pgClient;
+      try {
+        // Batch insert 500 rows at a time
+        for (let i = 0; i < rows.length; i += 500) {
+          const batch = rows.slice(i, i + 500);
+          const values = [];
+          const params = [];
+          let idx = 1;
+          for (const r of batch) {
+            values.push(`($${idx++}, $${idx++}, $${idx++}, $${idx++}, $${idx++})`);
+            params.push(r.chunk_x, r.chunk_y, r.x, r.y, r.color);
+          }
+          await client.query(
+            `INSERT INTO ${DELTA_TABLE} (chunk_x, chunk_y, x, y, color) VALUES ${values.join(",")}`,
+            params
+          );
+        }
+      } finally {
+        if (needRelease) client.release();
+      }
+    } else if (supabase) {
+      // Fallback via Supabase JS
+      for (let i = 0; i < rows.length; i += 500) {
+        const batch = rows.slice(i, i + 500);
+        const { error } = await supabase.from(DELTA_TABLE).insert(batch);
+        if (error) {
+          console.warn(`[delta] insert failed ${cx},${cy}:`, error.message);
+          break;
+        }
+      }
+    }
+  } catch (e) {
+    console.warn(`[delta] record failed ${cx},${cy}:`, e.message);
   }
 }
 
@@ -527,10 +599,41 @@ loadCanvas();
 // periodic save
 const saveInterval = setInterval(saveCanvas, SAVE_INTERVAL_MS);
 
+// ---- PNG cron (60s, dirty chunks only) ----
+let pngCronInterval = null;
+let pngCronRunning = false;
+async function runPngCron() {
+  if (pngCronRunning) return;
+  if (!pgPool) return;
+  // Skip if DB not ready (migrations not yet applied)
+  pngCronRunning = true;
+  try {
+    if (pngWorker && typeof pngWorker.processDirtyChunks === "function") {
+      const res = await pngWorker.processDirtyChunks(pgPool, supabase, { limit: PNG_MAX_PER_TICK });
+      if (res && (res.processed > 0 || res.errors > 0)) {
+        console.log(`[png-cron] processed=${res.processed} errors=${res.errors}`);
+      }
+    }
+  } catch (e) {
+    console.error("[png-cron] error:", e.message);
+  } finally {
+    pngCronRunning = false;
+  }
+}
+if (pgPool || supabase) {
+  pngCronInterval = setInterval(runPngCron, PNG_CRON_MS);
+  // 初回は起動30秒後に実行（DB負荷を避ける）
+  setTimeout(runPngCron, 30000);
+  console.log(`[png-cron] enabled every ${PNG_CRON_MS/1000}s (max ${PNG_MAX_PER_TICK}/tick, dirty-only)`);
+} else {
+  console.log("[png-cron] disabled (no DB)");
+}
+
 // Graceful shutdown: wait for in-progress save, then flush remaining pending changes
 async function gracefulShutdown(signal) {
   console.log(`\n[${signal}] saving...`);
   clearInterval(saveInterval);
+  if (pngCronInterval) clearInterval(pngCronInterval);
   // Wait for any in-progress Supabase save to finish (Render.com gives ~30s for SIGTERM)
   const startTime = Date.now();
   while (isSaving && Date.now() - startTime < 25000) {
@@ -548,7 +651,7 @@ process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 
 // ---- Health ----
-app.get("/health", (req, res) => res.json({ ok: true, ready, pixels: canvasData.size, storage: (supabase || pgPool) ? "supabase" : "file", usePg: usePgFallback, error: loadError || undefined }));
+app.get("/health", (req, res) => res.json({ ok: true, ready, pixels: canvasData.size, storage: (supabase || pgPool) ? "supabase" : "file", usePg: usePgFallback, pngCron: !!(pgPool || supabase), error: loadError || undefined }));
 
 // ---- Viewport API ----
 // GET /api/pixels?x0=&y0=&x1=&y1=  (grid coords)
@@ -592,7 +695,7 @@ app.get("/api/pixels", async (req, res) => {
 });
 
 // ---- Chunk API ----
-// GET /api/chunks?cx=&cy=  returns binary chunk data
+// GET /api/chunks?cx=&cy=  returns binary chunk data (Phase4: ETag + Cache-Control)
 app.get("/api/chunks", async (req, res) => {
   if (!supabase && !pgPool) {
     return res.status(503).json({ error: "no db" });
@@ -603,44 +706,238 @@ app.get("/api/chunks", async (req, res) => {
     return res.status(400).json({ error: "cx,cy required as integers" });
   }
   let data;
+  let pixelCount = 0;
+  let updatedAt = null;
   try {
     if (supabase && !usePgFallback) {
       const result = await supabase
         .from(CHUNK_TABLE)
-        .select("data")
+        .select("data,pixel_count,updated_at")
         .eq("chunk_x", cx)
         .eq("chunk_y", cy)
         .single();
       if (result.error) {
         if (result.error.code === "PGRST116") {
-          res.set("Cache-Control", "no-cache, no-store, must-revalidate");
+          const emptyTag = `W/"${cx}-${cy}-empty"`;
+          res.set("Cache-Control", "public, max-age=10, stale-while-revalidate=30");
+          res.set("ETag", emptyTag);
+          const inmEmpty2 = req.headers["if-none-match"];
+          if (inmEmpty2 && (inmEmpty2 === emptyTag || inmEmpty2.split(",").map(s=>s.trim()).includes(emptyTag))) return res.status(304).end();
           return res.status(404).json({ error: "no chunk" });
         }
         return res.status(500).json({ error: result.error.message });
       }
       data = result.data;
+      pixelCount = result.data.pixel_count || 0;
+      updatedAt = result.data.updated_at;
     } else if (pgPool) {
       const pgClient = await pgPool.connect();
       try {
         const result = await pgClient.query(
-          `SELECT data FROM ${CHUNK_TABLE} WHERE chunk_x = $1 AND chunk_y = $2`,
+          `SELECT data, pixel_count, updated_at FROM ${CHUNK_TABLE} WHERE chunk_x = $1 AND chunk_y = $2`,
           [cx, cy]
         );
         if (result.rows.length === 0) {
-          res.set("Cache-Control", "no-cache, no-store, must-revalidate");
+          const emptyTag = `W/"${cx}-${cy}-empty"`;
+          res.set("Cache-Control", "public, max-age=10, stale-while-revalidate=30");
+          res.set("ETag", emptyTag);
+          const inmEmpty = req.headers["if-none-match"];
+          if (inmEmpty && (inmEmpty === emptyTag || inmEmpty.split(",").map(s=>s.trim()).includes(emptyTag))) return res.status(304).end();
           return res.status(404).json({ error: "no chunk" });
         }
         data = result.rows[0];
+        pixelCount = data.pixel_count || 0;
+        updatedAt = data.updated_at;
       } finally {
         pgClient.release();
       }
     }
     const buf = bufferToUint8Array(data.data);
+    const etag = `W/"${cx}-${cy}-${pixelCount}-${buf.length}-${updatedAt ? new Date(updatedAt).getTime() : 0}"`;
+    const inm = req.headers["if-none-match"];
+    if (inm && (inm === etag || inm.split(",").map(s=>s.trim()).includes(etag) || inm.includes(etag))) {
+      res.set("ETag", etag);
+      res.set("Cache-Control", "public, max-age=30, stale-while-revalidate=60");
+      return res.status(304).end();
+    }
     res.set("Content-Type", "application/octet-stream");
-    res.set("Cache-Control", "no-cache, no-store, must-revalidate");
+    res.set("Cache-Control", "public, max-age=30, stale-while-revalidate=60");
+    res.set("ETag", etag);
     return res.send(Buffer.from(buf));
   } catch (e) {
     console.error("[api/chunks] error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---- PNG proxy endpoint (Supabase Storage) ----
+// GET /api/chunks/:cx/:cy/png  256x256 PNG
+app.get("/api/chunks/:cx/:cy/png", async (req, res) => {
+  const cx = parseInt(req.params.cx, 10);
+  const cy = parseInt(req.params.cy, 10);
+  if (!Number.isInteger(cx) || !Number.isInteger(cy)) {
+    return res.status(400).json({ error: "cx,cy must be integers" });
+  }
+  try {
+    let pngMeta = null;
+    if (pgPool) {
+      const c = await pgPool.connect();
+      try {
+        const r = await c.query(
+          `SELECT png_etag, png_generated_at, png_storage_path FROM ${CHUNK_TABLE} WHERE chunk_x=$1 AND chunk_y=$2`,
+          [cx, cy]
+        );
+        pngMeta = r.rows[0] || null;
+      } finally { c.release(); }
+    } else if (supabase) {
+      const { data, error } = await supabase.from(CHUNK_TABLE).select("png_etag,png_generated_at,png_storage_path").eq("chunk_x", cx).eq("chunk_y", cy).single();
+      if (!error) pngMeta = data;
+    }
+
+    if (!pngMeta || !pngMeta.png_storage_path) {
+      // PNG未生成: オンデマンド生成フォールバック（白背景256x256）
+      if (!pngWorker) return res.status(503).json({ error: "png worker not available" });
+      let pixels = [];
+      let needGenerate = false;
+      if (pgPool) {
+        const c2 = await pgPool.connect();
+        try {
+          const r2 = await c2.query(`SELECT data FROM ${CHUNK_TABLE} WHERE chunk_x=$1 AND chunk_y=$2`, [cx, cy]);
+          if (r2.rows[0] && r2.rows[0].data) {
+            pixels = ChunkCodec.decode(bufferToUint8Array(r2.rows[0].data));
+            needGenerate = true;
+          }
+        } finally { c2.release(); }
+      } else if (supabase) {
+        const { data: ch } = await supabase.from(CHUNK_TABLE).select("data").eq("chunk_x", cx).eq("chunk_y", cy).single();
+        if (ch && ch.data) {
+          pixels = ChunkCodec.decode(bufferToUint8Array(ch.data));
+          needGenerate = true;
+        }
+      }
+      if (!needGenerate) return res.status(404).json({ error: "no chunk" });
+      const pngBuf = await pngWorker.renderChunkToPng(pixels, CHUNK_SIZE);
+      const etag = `W/"${cx}-${cy}-${pngBuf.length}-${Date.now()}"`;
+      if (req.headers["if-none-match"] === etag) return res.status(304).end();
+      res.set("ETag", etag);
+      res.set("Cache-Control", "public, max-age=30, stale-while-revalidate=60");
+      res.set("Content-Type", "image/png");
+      return res.send(pngBuf);
+    }
+
+    const etag = pngMeta.png_etag || `W/"${cx}-${cy}-${new Date(pngMeta.png_generated_at).getTime()}"`;
+    if (req.headers["if-none-match"] && req.headers["if-none-match"] === etag) {
+      res.set("ETag", etag);
+      res.set("Cache-Control", "public, max-age=60, stale-while-revalidate=120");
+      return res.status(304).end();
+    }
+
+    if (!supabase) return res.status(503).json({ error: "storage not configured" });
+    const storagePath = pngMeta.png_storage_path;
+    const { data: blob, error: dlErr } = await supabase.storage.from(PNG_BUCKET).download(storagePath);
+    if (dlErr) {
+      console.error(`[png] download failed ${storagePath}:`, dlErr.message);
+      return res.status(502).json({ error: "storage download failed", detail: dlErr.message });
+    }
+    const arrayBuf = await blob.arrayBuffer();
+    res.set("ETag", etag);
+    res.set("Cache-Control", "public, max-age=60, stale-while-revalidate=120");
+    res.set("Content-Type", "image/png");
+    if (pngMeta.png_generated_at) res.set("Last-Modified", new Date(pngMeta.png_generated_at).toUTCString());
+    return res.send(Buffer.from(arrayBuf));
+  } catch (e) {
+    console.error("[png] error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---- Delta endpoint ----
+// GET /api/delta?cx=0&cy=0&since=2026-09-01T00:00:00.000Z
+// or  GET /api/delta?chunks=0:0,1:0&since=...
+app.get("/api/delta", async (req, res) => {
+  try {
+    const sinceRaw = req.query.since;
+    let since = null;
+    if (sinceRaw) {
+      since = new Date(sinceRaw);
+      if (isNaN(since.getTime())) return res.status(400).json({ error: "invalid since" });
+    } else {
+      since = new Date(0);
+    }
+
+    let chunks = [];
+    if (req.query.chunks) {
+      chunks = String(req.query.chunks).split(",").map(s => {
+        const [a,b] = s.split(":").map(Number);
+        return [a,b];
+      }).filter(([a,b]) => Number.isInteger(a) && Number.isInteger(b));
+    } else if (req.query.cx !== undefined && req.query.cy !== undefined) {
+      const cx = parseInt(req.query.cx, 10), cy = parseInt(req.query.cy, 10);
+      if (Number.isInteger(cx) && Number.isInteger(cy)) chunks = [[cx,cy]];
+    }
+    if (chunks.length === 0) return res.status(400).json({ error: "chunks or cx,cy required" });
+    if (chunks.length > 25) return res.status(400).json({ error: "too many chunks (max 25)" });
+
+    const MAX_DELTAS = 10000;
+    let out = [];
+    let truncated = false;
+
+    if (pgPool) {
+      const client = await pgPool.connect();
+      try {
+        for (const [cx,cy] of chunks) {
+          const r = await client.query(
+            `SELECT x,y,color,created_at FROM ${DELTA_TABLE}
+             WHERE chunk_x=$1 AND chunk_y=$2 AND created_at > $3
+             ORDER BY created_at ASC LIMIT $4`,
+            [cx, cy, since.toISOString(), MAX_DELTAS - out.length]
+          );
+          for (const row of r.rows) out.push({ x: row.x, y: row.y, color: row.color, created_at: row.created_at });
+          if (out.length >= MAX_DELTAS) { truncated = true; break; }
+        }
+      } finally { client.release(); }
+    } else if (supabase) {
+      for (const [cx,cy] of chunks) {
+        const { data, error } = await supabase.from(DELTA_TABLE)
+          .select("x,y,color,created_at")
+          .eq("chunk_x", cx).eq("chunk_y", cy).gt("created_at", since.toISOString())
+          .order("created_at", { ascending: true }).limit(MAX_DELTAS - out.length);
+        if (error) return res.status(500).json({ error: error.message });
+        if (data) for (const row of data) out.push({ x: row.x, y: row.y, color: row.color, created_at: row.created_at });
+        if (out.length >= MAX_DELTAS) { truncated = true; break; }
+      }
+    } else {
+      return res.status(503).json({ error: "no db" });
+    }
+
+    res.set("Cache-Control", "no-cache");
+    return res.json({ deltas: out, truncated, serverTime: new Date().toISOString() });
+  } catch (e) {
+    console.error("[delta] error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---- PNG meta (debug) ----
+app.get("/api/png-meta", async (req, res) => {
+  try {
+    if (!pgPool) return res.json({ enabled: false, reason: "no pgPool" });
+    const c = await pgPool.connect();
+    try {
+      const total = await c.query(`SELECT count(*)::int AS c FROM ${CHUNK_TABLE}`);
+      const withPng = await c.query(`SELECT count(*)::int AS c FROM ${CHUNK_TABLE} WHERE png_generated_at IS NOT NULL`);
+      const dirty = await c.query(`SELECT count(*)::int AS c FROM ${CHUNK_TABLE} WHERE png_generated_at IS NULL OR updated_at > png_generated_at`);
+      const deltas = await c.query(`SELECT count(*)::int AS c FROM ${DELTA_TABLE} WHERE created_at > NOW() - INTERVAL '7 days'`);
+      res.json({
+        enabled: true,
+        bucket: PNG_BUCKET,
+        cronMs: PNG_CRON_MS,
+        maxPerTick: PNG_MAX_PER_TICK,
+        chunks: { total: total.rows[0].c, withPng: withPng.rows[0].c, dirty: dirty.rows[0].c },
+        deltas7d: deltas.rows[0].c,
+      });
+    } finally { c.release(); }
+  } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });

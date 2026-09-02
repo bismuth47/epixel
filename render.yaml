@@ -4,7 +4,7 @@ services:
     region: omaha
     plan: free
     env: node
-    buildCommand: npm install
+    buildCommand: npm install && npm run migrate-png || echo "migrate skipped (non-fatal)"
     startCommand: npm start
     healthCheckPath: /health
     envVars:
