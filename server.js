@@ -862,9 +862,9 @@ app.get("/api/chunks/:cx/:cy/png", async (req, res) => {
 });
 
 // ---- Delta endpoint ----
-// GET /api/delta?cx=0&cy=0&since=2026-09-01T00:00:00.000Z
+// GET /api/delta?cx=0&cy=0&since=2026-09-01T00:00:00.000Z  (alias: /api/deltas)
 // or  GET /api/delta?chunks=0:0,1:0&since=...
-app.get("/api/delta", async (req, res) => {
+async function handleDelta(req, res) {
   try {
     const sinceRaw = req.query.since;
     let since = null;
@@ -898,7 +898,7 @@ app.get("/api/delta", async (req, res) => {
         for (const [cx,cy] of chunks) {
           const r = await client.query(
             `SELECT x,y,color,created_at FROM ${DELTA_TABLE}
-             WHERE chunk_x=$1 AND chunk_y=$2 AND created_at > $3
+             WHERE chunk_x=$1 AND chunk_y=$2 AND created_at >= $3
              ORDER BY created_at ASC LIMIT $4`,
             [cx, cy, since.toISOString(), MAX_DELTAS - out.length]
           );
@@ -910,7 +910,7 @@ app.get("/api/delta", async (req, res) => {
       for (const [cx,cy] of chunks) {
         const { data, error } = await supabase.from(DELTA_TABLE)
           .select("x,y,color,created_at")
-          .eq("chunk_x", cx).eq("chunk_y", cy).gt("created_at", since.toISOString())
+          .eq("chunk_x", cx).eq("chunk_y", cy).gte("created_at", since.toISOString())
           .order("created_at", { ascending: true }).limit(MAX_DELTAS - out.length);
         if (error) return res.status(500).json({ error: error.message });
         if (data) for (const row of data) out.push({ x: row.x, y: row.y, color: row.color, created_at: row.created_at });
@@ -926,7 +926,9 @@ app.get("/api/delta", async (req, res) => {
     console.error("[delta] error:", e.message);
     res.status(500).json({ error: e.message });
   }
-});
+}
+app.get("/api/delta", handleDelta);
+app.get("/api/deltas", handleDelta);
 
 // ---- PNG meta (debug) ----
 app.get("/api/png-meta", async (req, res) => {

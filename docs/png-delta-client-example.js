@@ -40,8 +40,11 @@ async function fetchChunkPngWithDelta(cx, cy, ctx, pixelSize, tilePixels, setPix
     // 空チャンク: 何も描画せず delta のみ後で処理
     pngTimestamp = new Date(0).toISOString();
   } else if (pngRes.ok) {
-    // ETag / Last-Modified を差分取得の since に使う
-    pngTimestamp = pngRes.headers.get("Last-Modified") || pngRes.headers.get("ETag") || new Date().toISOString();
+    // X-PNG-Generated-At(ms精度)を優先、Last-Modifiedは秒精度で切り捨て発生のためフォールバック
+    pngTimestamp = pngRes.headers.get("X-PNG-Generated-At") || pngRes.headers.get("Last-Modified") || new Date().toISOString();
+    if (!pngRes.headers.get("X-PNG-Generated-At") && pngRes.headers.get("Last-Modified")) {
+      console.warn("[png] X-PNG-Generated-At missing, using Last-Modified (sec precision)");
+    }
     // 304 の場合は Service Worker / HTTPキャッシュが既に持っている PNG を使う想定
     // ここでは 200 の場合のみ bitmap 化
     if (pngRes.status === 200) {

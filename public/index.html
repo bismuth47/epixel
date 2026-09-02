@@ -1030,32 +1030,116 @@
     const maxGridY = Math.floor(vb.maxWorldY / PIXEL_SIZE) + padGrid;
     return {x0:minGridX,y0:minGridY,x1:maxGridX,y1:maxGridY};
   }
-  async function fetchDeltaSince(cx, cy, sinceIso){
-    try{
-      const url = `/api/delta?cx=${cx}&cy=${cy}&since=${encodeURIComponent(sinceIso)}`;
-      const res = await fetch(url, { cache: "no-store" });
-      if(!res.ok){
-        if(res.status===404) return { count: 0, truncated: false };
-        console.warn("[delta] failed", `${cx},${cy}`, res.status);
-        return { count: 0, truncated: false };
+  // Delta sync state (role separated from fetchedTiles which is PNG-only)
+  const deltaRetryCount = new Map(); // "cx,cy" -> consecutive failures
+  const DELTA_POLL_MS = 5000;
+  let deltaPollTimer = null;
+  let deltaPollInFlight = false;
+
+  function getLatestDeltaIso(deltas, serverTime){
+    if(deltas && deltas.length > 0){
+      // deltas are ASC, last element is newest created_at
+      const last = deltas[deltas.length - 1];
+      if(last.created_at){
+        const d = new Date(last.created_at);
+        if(!isNaN(d.getTime())) return d.toISOString();
       }
-      const j = await res.json();
-      // サーバ時刻オフセットを更新（以降のsince補正に使用）
-      if(j.serverTime){
-        const st = new Date(j.serverTime).getTime();
-        if(!isNaN(st)) serverTimeOffset = st - Date.now();
-      }
-      const deltas = j.deltas || [];
-      for(const d of deltas){
-        const gx = d.x, gy = d.y, color = d.color;
-        if(color===255) deletePixel(gx, gy);
-        else {
-          const col = CODE_TO_COLOR[color];
-          if(col) setPixel(gx, gy, col);
+    }
+    if(serverTime){
+      const d = new Date(serverTime);
+      if(!isNaN(d.getTime())) return d.toISOString();
+    }
+    return null;
+  }
+
+  async function fetchDeltaSince(cx, cy, sinceIso, opts = {}){
+    const maxRetries = opts.maxRetries ?? 0;
+    const baseDelay = opts.baseDelay ?? 500;
+    let attempt = 0;
+    while(true){
+      try{
+        const url = `/api/delta?cx=${cx}&cy=${cy}&since=${encodeURIComponent(sinceIso)}`;
+        const res = await fetch(url, { cache: "no-store" });
+        if(!res.ok){
+          if(res.status===404) return { count: 0, truncated: false, serverTime: null };
+          throw new Error(`HTTP ${res.status}`);
         }
+        const j = await res.json();
+        // サーバ時刻オフセットを更新（以降のsince補正に使用）
+        if(j.serverTime){
+          const st = new Date(j.serverTime).getTime();
+          if(!isNaN(st)) serverTimeOffset = st - Date.now();
+        }
+        const deltas = j.deltas || [];
+        for(const d of deltas){
+          const gx = d.x, gy = d.y, color = d.color;
+          if(color===255) deletePixel(gx, gy);
+          else {
+            const col = CODE_TO_COLOR[color];
+            if(col) setPixel(gx, gy, col);
+          }
+        }
+        // 成功時は tilePngAt を最新 created_at / serverTime で前進（次回ポーリングの since に使う）
+        const key = `${cx},${cy}`;
+        const latestIso = getLatestDeltaIso(deltas, j.serverTime);
+        if(latestIso){
+          // 単調増加のみ（時計戻り防止）
+          const cur = tilePngAt.get(key);
+          if(!cur || new Date(latestIso).getTime() > new Date(cur).getTime()){
+            tilePngAt.set(key, latestIso);
+          }
+        }
+        deltaRetryCount.delete(`${cx},${cy}`);
+        // truncated は呼び出し側で binary fallback へ
+        if(j.truncated){
+          console.warn("[delta] truncated >10000, fallback to binary", key);
+          clearTilePixels(cx, cy);
+          // fetchingTilesガードを避けて直接バイナリ再取得
+          await (async()=>{
+            const url2 = `/api/chunks?cx=${cx}&cy=${cy}`;
+            let r2 = await fetch(url2, { cache: "reload" });
+            if(r2.status===404) return;
+            if(!r2.ok){ console.warn("[delta-truncated-binary] failed", key, r2.status); return; }
+            const buf = await r2.arrayBuffer();
+            const binary = new Uint8Array(buf);
+            const pxs = ChunkCodec.decode(binary);
+            const CHUNK = 2500;
+            for(let i=0;i<pxs.length;i+=CHUNK){
+              const slice = pxs.slice(i, i+CHUNK);
+              for(const p of slice){
+                const gx = cx * TILE + p.x;
+                const gy = cy * TILE + p.y;
+                setPixel(gx, gy, CODE_TO_COLOR[p.colorId]);
+              }
+              if(pxs.length > CHUNK && i+CHUNK < pxs.length) await new Promise(r=> requestAnimationFrame(()=>r()));
+            }
+            // バイナリ取得後は最新時刻で更新
+            tilePngAt.set(key, new Date(Date.now() + serverTimeOffset).toISOString());
+          })();
+        }
+        if(deltas.length > 0) scheduleRender();
+        return { count: deltas.length, truncated: !!j.truncated, serverTime: j.serverTime || null };
+      }catch(e){
+        const key = `${cx},${cy}`;
+        const curRetry = deltaRetryCount.get(key) || 0;
+        deltaRetryCount.set(key, curRetry + 1);
+        if(attempt < maxRetries){
+          const delay = baseDelay * Math.pow(2, attempt);
+          console.warn(`[delta] retry ${attempt+1}/${maxRetries} for ${key} after ${delay}ms:`, e.message);
+          await new Promise(r=> setTimeout(r, delay));
+          attempt++;
+          continue;
+        }
+        console.warn("[delta] failed", `${cx},${cy}`, e.message);
+        // 失敗時は tilePngAt を進めず次tickでリトライ
+        return { count: 0, truncated: false, serverTime: null, error: e.message };
       }
-      return { count: deltas.length, truncated: !!j.truncated };
-    }catch(e){ console.warn("[delta] error", e.message); return { count: 0, truncated: false }; }
+    }
+  }
+
+  // 指数バックオフ付きラッパ（可視タイルの定期同期や欠損リカバリで使用）
+  function fetchDeltaSinceWithRetry(cx, cy, sinceIso){
+    return fetchDeltaSince(cx, cy, sinceIso, { maxRetries: 3, baseDelay: 500 });
   }
   function clearTilePixels(cx, cy){
     const key = `${cx},${cy}`;
@@ -1145,7 +1229,7 @@
           }
         }
         if(pngRes.ok){
-          // since補正: サーバ時刻を優先（X-PNG-Generated-At > Last-Modified > Dateヘッダ）
+          // since補正: X-PNG-Generated-At(ms精度)を最優先。Last-Modifiedは秒精度で切り捨てのためフォールバック時のみ使用
           const pgAt = pngRes.headers.get("X-PNG-Generated-At");
           const lastMod = pngRes.headers.get("Last-Modified");
           const dateHdr = pngRes.headers.get("Date");
@@ -1156,15 +1240,22 @@
           }
           if(!iso && lastMod){
             const d = new Date(lastMod);
-            if(!isNaN(d.getTime())) iso = d.toISOString();
+            if(!isNaN(d.getTime())){
+              iso = d.toISOString();
+              console.warn("[png] X-PNG-Generated-At missing, fallback to Last-Modified (sec precision, may over-fetch):", lastMod, "->", iso);
+            }
           }
           if(!iso && dateHdr){
             const d = new Date(dateHdr);
-            if(!isNaN(d.getTime())) iso = d.toISOString();
+            if(!isNaN(d.getTime())){
+              iso = d.toISOString();
+              console.warn("[png] X-PNG-Generated-At/Last-Modified missing, fallback to Date:", dateHdr, "->", iso);
+            }
           }
           if(!iso){
             // ヘッダ欠落時はサーバ時刻オフセット補正した現在時刻を使う（クライアント時計ずれ対策）
             iso = new Date(Date.now() + serverTimeOffset).toISOString();
+            console.warn("[png] all time headers missing, fallback to Date.now()+offset:", iso);
           }
           pngAtIso = iso;
           tilePngAt.set(key, pngAtIso);
@@ -1194,40 +1285,11 @@
         console.warn("[png] error", key, e.message);
         return await fetchTileBinaryFallback(tile);
       }
-      // ② 差分取得（PNG生成時刻以降）
+      // ② 差分取得（PNG生成時刻以降）- 指数バックオフ付き、truncatedはfetchDeltaSince内でフォールバック済み
       const sinceIso = pngAtIso || tilePngAt.get(key) || new Date(0).toISOString();
-      const deltaRes = await fetchDeltaSince(cx, cy, sinceIso);
-      if(deltaRes.truncated){
-        console.warn("[delta] truncated >10000, fallback to binary", key);
-        // PNG+部分deltaでは不完全なので、バイナリ全体で再取得
-        clearTilePixels(cx, cy);
-        // fetchingTilesは既にセットされているため、binaryパスを直接実行（重複ガードを避ける）
-        const n = await (async()=>{
-          const url = `/api/chunks?cx=${cx}&cy=${cy}`;
-          let res = await fetch(url, { cache: "reload" });
-          if(res.status===404){ fetchedTiles.add(key); return 0; }
-          if(!res.ok){ console.warn("[fetchTile-binary-truncated] failed", key, res.status); fetchedTiles.add(key); return 0; }
-          const buf = await res.arrayBuffer();
-          const binary = new Uint8Array(buf);
-          const pxs = ChunkCodec.decode(binary);
-          const CHUNK = 2500;
-          for(let i=0;i<pxs.length;i+=CHUNK){
-            const slice = pxs.slice(i, i+CHUNK);
-            for(const p of slice){
-              const gx = cx * TILE + p.x;
-              const gy = cy * TILE + p.y;
-              setPixel(gx, gy, CODE_TO_COLOR[p.colorId]);
-            }
-            if(pxs.length > CHUNK && i+CHUNK < pxs.length) await new Promise(r=> requestAnimationFrame(()=>r()));
-          }
-          fetchedTiles.add(key);
-          return pxs.length;
-        })();
-        return n;
-      }
+      const deltaRes = await fetchDeltaSince(cx, cy, sinceIso, { maxRetries: 2, baseDelay: 400 });
+      // truncated時のbinaryフォールバックはfetchDeltaSince内で実行済み（重複防止のためここでは追加処理なし）
       fetchedTiles.add(key);
-      // base と delta 合計（概算で baseは不明のため deltaRes.countを返す、0でも描画はされる）
-      // 正確なピクセル数は tilePixels から取得できるが、呼び出し元は total に使うだけ
       return deltaRes.count;
     }catch(e){
       console.warn("[fetchTile] error", tile.key, e.message);
@@ -1243,7 +1305,7 @@
       return;
     }
     const tiles = getTilesForViewportSorted();
-    // 同一セッションで再生成しない: 未取得のみを対象にし、sliceはその後に適用
+    // 役割分離: PNG取得のみを fetchedTiles でガード、Deltaは常に対象（fetchDeltaSince側で tilePngAt 管理）
     const unfetched = tiles.filter(t=> !fetchedTiles.has(t.key) && !fetchingTiles.has(t.key));
     if(unfetched.length===0){
       if(force && !initialLoaded){ initialLoaded=true; hideLoading(); scheduleRender(); }
@@ -1277,6 +1339,40 @@
       scheduleIdlePrefetch();
     }
   }
+  // ---- Delta定期同期（5秒ポーリング）: 可視タイルの差分のみを再取得、PNGキャッシュは触らない ----
+  async function syncVisibleDeltas(){
+    if(deltaPollInFlight) return;
+    if(isOffline()) return;
+    if(document.visibilityState === "hidden") return;
+    const tiles = getTilesForViewportSorted();
+    // tilePngAtを持つ＝既にPNG取得済みの可視タイルのみが対象（未取得タイルは fetchViewport が担当）
+    const targets = tiles.filter(t=> tilePngAt.has(t.key));
+    if(targets.length===0) return;
+    deltaPollInFlight = true;
+    try{
+      // 同時実行は2並列に制限（サーバ負荷対策）
+      const CONCURRENCY = 2;
+      for(let i=0;i<targets.length;i+=CONCURRENCY){
+        const batch = targets.slice(i, i+CONCURRENCY);
+        await Promise.all(batch.map(async t=>{
+          const sinceIso = tilePngAt.get(t.key) || new Date(0).toISOString();
+          // 指数バックオフ付き、失敗時は tilePngAt を進めず次tickでリトライ
+          await fetchDeltaSinceWithRetry(t.tx, t.ty, sinceIso);
+        }));
+        if(i+CONCURRENCY < targets.length) await new Promise(r=> setTimeout(r, 50));
+      }
+    }finally{
+      deltaPollInFlight = false;
+    }
+  }
+  function startDeltaPolling(){
+    if(deltaPollTimer) return;
+    deltaPollTimer = setInterval(()=>{ syncVisibleDeltas().catch(e=> console.warn("[delta-poll] error", e.message)); }, DELTA_POLL_MS);
+  }
+  function stopDeltaPolling(){
+    if(deltaPollTimer){ clearInterval(deltaPollTimer); deltaPollTimer = null; }
+  }
+
   let lastFetchAt = 0;
   function scheduleViewportFetch(){
     clearTimeout(fetchTimer);
@@ -2573,6 +2669,15 @@
       showLoading("再接続中...", "接続が復帰しました。読み込みを再開します。");
       // 少し待ってから再試行 (SWやネットワークの安定待ち)
       setTimeout(()=> fetchViewport(true), 300);
+    } else {
+      // オンライン復帰時は fetchedTiles をクリアせず差分のみ再取得
+      setTimeout(()=> syncVisibleDeltas().catch(e=> console.warn("[online-delta] error", e.message)), 400);
+    }
+  });
+  // タブ復帰時は差分のみ再取得（PNGキャッシュは維持）
+  document.addEventListener("visibilitychange", ()=>{
+    if(document.visibilityState === "visible" && initialLoaded && !isOffline()){
+      syncVisibleDeltas().catch(e=> console.warn("[visibility-delta] error", e.message));
     }
   });
 
@@ -2595,6 +2700,10 @@
     statusEl.className = "online";
     connTextEl.textContent = "オンライン";
     if(!initialLoaded && !isOffline()) fetchViewport(true);
+    else if(initialLoaded && !isOffline()){
+      // 再接続時は fetchedTiles をクリアせず可視タイルの差分のみ一括再取得
+      syncVisibleDeltas().catch(e=> console.warn("[socket-delta] error", e.message));
+    }
   });
   socket.on("disconnect", () => {
     statusEl.className = "offline";
@@ -2668,6 +2777,10 @@
   if(!isOffline()) fetchViewport(true);
   // Also poll ready if socket already connected
   if(window.fetch) setTimeout(()=>{ if(!initialLoaded && !isOffline()) fetchViewport(true); }, 800);
+  // 5秒周期の差分ポーリング開始（PNGとは独立、tilePngAtベース）
+  startDeltaPolling();
+  // ページ離脱時にポーリング停止
+  window.addEventListener("beforeunload", stopDeltaPolling);
 })();
 </script>
 </body>

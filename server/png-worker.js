@@ -111,10 +111,12 @@ async function processDirtyChunks(pgPool, supabase, opts = {}) {
 
   try {
     // 1) dirty chunk抽出（変更がないチャンクはスキップ）
+    // 同刻停滞対策: updated_at == png_generated_at のµs一致でPNGが古いまま停滞するのを防ぐため >= に変更
+    // 正常時は png_generated_at > updated_at なので >= でも steady state は dirtyにならない（1回余分に再生成されるのみ）
     const { rows } = await client.query(
       `SELECT chunk_x, chunk_y, data, updated_at, png_generated_at
        FROM canvas_chunks
-       WHERE png_generated_at IS NULL OR updated_at > png_generated_at
+       WHERE png_generated_at IS NULL OR updated_at >= png_generated_at
        ORDER BY updated_at ASC
        LIMIT $1`,
       [limit]
@@ -122,13 +124,14 @@ async function processDirtyChunks(pgPool, supabase, opts = {}) {
 
     if (rows.length === 0) {
       // dirtyが無いときでも、過去のバグで残った stale delta（png_generated_at以前）を掃除
+      // 安全性強化: < に変更（= のdeltaは次回ポーリングで取得可能なため残す、PNGに含まれる保証がない）
       try {
         const cleaned = await client.query(
           `DELETE FROM canvas_pixel_deltas d
            USING canvas_chunks c
            WHERE d.chunk_x = c.chunk_x AND d.chunk_y = c.chunk_y
              AND c.png_generated_at IS NOT NULL
-             AND d.created_at <= c.png_generated_at`
+             AND d.created_at < c.png_generated_at`
         );
         if (cleaned.rowCount > 0) console.log(`[png-worker] stale delta cleanup: ${cleaned.rowCount} rows`);
       } catch (e) {
@@ -172,9 +175,10 @@ async function processDirtyChunks(pgPool, supabase, opts = {}) {
         // DBのメタ更新（RETURNINGで確定時刻を取得してdelta削除に利用）
         // レース対策: 同時書き込みでupdated_atが進んでいたらpng_generated_atを進めない
         // → そのdeltaは次tickでPNGに含めてから削除する（タイムラグ埋めの欠落防止）
+        // 安全性強化: トランザクション境界を明確化するため clock_timestamp() を使用し、DELETEは < に変更
         const upd = await client.query(
           `UPDATE canvas_chunks
-           SET png_generated_at = NOW(), png_etag = $1, png_storage_path = $2
+           SET png_generated_at = clock_timestamp(), png_etag = $1, png_storage_path = $2
            WHERE chunk_x = $3 AND chunk_y = $4 AND updated_at = $5
            RETURNING png_generated_at`,
           [etag, storagePathVal, cx, cy, oldUpdatedAt]
@@ -186,12 +190,13 @@ async function processDirtyChunks(pgPool, supabase, opts = {}) {
         }
         const pngAt = upd.rows[0]?.png_generated_at;
 
-        // PNGに吸収されたdeltaを削除（png_generated_at以前は不要）
-        // レース対策: 同時書き込みで created_at == png_generated_at のdeltaが消えないよう <= を使用
+        // PNGに吸収されたdeltaを削除（png_generated_at未満のみ削除）
+        // 変更: <= から < に変更。= のdeltaは µs一致でPNGに含まれていない可能性があるため残し、
+        // クライアントの >= 取得（server.js:901）で次回ポーリングで回収させる
         if (pngAt) {
           await client.query(
             `DELETE FROM canvas_pixel_deltas
-             WHERE chunk_x = $1 AND chunk_y = $2 AND created_at <= $3`,
+             WHERE chunk_x = $1 AND chunk_y = $2 AND created_at < $3`,
             [cx, cy, pngAt]
           );
         }
@@ -210,13 +215,14 @@ async function processDirtyChunks(pgPool, supabase, opts = {}) {
     }
 
     // 今回処理した分以外にも残っている stale delta をまとめて掃除（dirtyでないchunkの過去残留分）
+    // < に変更（= は次回ポーリングで回収）
     try {
       const cleaned = await client.query(
         `DELETE FROM canvas_pixel_deltas d
          USING canvas_chunks c
          WHERE d.chunk_x = c.chunk_x AND d.chunk_y = c.chunk_y
            AND c.png_generated_at IS NOT NULL
-           AND d.created_at <= c.png_generated_at`
+           AND d.created_at < c.png_generated_at`
       );
       if (cleaned.rowCount > 0) console.log(`[png-worker] stale delta cleanup: ${cleaned.rowCount} rows`);
     } catch (e) {
