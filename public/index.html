@@ -463,11 +463,16 @@
   function getPngDecodeCtx(){
     if(pngDecodeCtx) return pngDecodeCtx;
     if(typeof OffscreenCanvas !== 'undefined'){
-      try{ pngDecodeCanvas = new OffscreenCanvas(TILE, TILE); pngDecodeCtx = pngDecodeCanvas.getContext('2d', {willReadFrequently:true}); if(pngDecodeCtx) return pngDecodeCtx; }catch(_){}
+      try{
+        pngDecodeCanvas = new OffscreenCanvas(TILE, TILE);
+        pngDecodeCtx = pngDecodeCanvas.getContext('2d', {willReadFrequently:true});
+        if(pngDecodeCtx){ pngDecodeCtx.imageSmoothingEnabled = false; return pngDecodeCtx; }
+      }catch(_){}
     }
     pngDecodeCanvas = document.createElement('canvas');
     pngDecodeCanvas.width = TILE; pngDecodeCanvas.height = TILE;
     pngDecodeCtx = pngDecodeCanvas.getContext('2d', {willReadFrequently:true});
+    if(pngDecodeCtx) pngDecodeCtx.imageSmoothingEnabled = false;
     return pngDecodeCtx;
   }
   async function decodePngToPixels(bitmap, cx, cy){
@@ -1569,8 +1574,12 @@
   function render() {
     flushPendingTransform();
     const dpr = window.devicePixelRatio || 1;
-    const w = canvas.width / dpr;
-    const h = canvas.height / dpr;
+    const w = Math.floor(canvas.width / dpr);
+    const h = Math.floor(canvas.height / dpr);
+    // snap offsets to device pixel to avoid sub-pixel tile seams (white lines)
+    const snap = 1 / (scale * dpr);
+    const snappedOffsetX = Math.round(offsetX / snap) * snap;
+    const snappedOffsetY = Math.round(offsetY / snap) * snap;
 
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.imageSmoothingEnabled = false;
@@ -1582,12 +1591,12 @@
 
     ctx.save();
     gridCtx.save();
-    ctx.translate(w / 2, h / 2);
+    ctx.translate(Math.floor(w / 2), Math.floor(h / 2));
     ctx.scale(scale, scale);
-    ctx.translate(-offsetX, -offsetY);
-    gridCtx.translate(w / 2, h / 2);
+    ctx.translate(-snappedOffsetX, -snappedOffsetY);
+    gridCtx.translate(Math.floor(w / 2), Math.floor(h / 2));
     gridCtx.scale(scale, scale);
-    gridCtx.translate(-offsetX, -offsetY);
+    gridCtx.translate(-snappedOffsetX, -snappedOffsetY);
     ctx.imageSmoothingEnabled = false;
     gridCtx.imageSmoothingEnabled = false;
 
@@ -1644,9 +1653,11 @@
       if(!entry || (!entry.canvas && !entry.bitmap)) continue;
       entry.lastUsed = Date.now();
       // tile canvas is TILE x TILE (1px per grid cell), draw scaled to world size
+      // overlap by 0.5/scale to hide sub-pixel seams (white lines) at tile boundaries
+      const overlap = 0.5 / scale;
       ctx.imageSmoothingEnabled = false;
       const src = entry.bitmap || entry.canvas;
-      ctx.drawImage(src, tile.x0 * PIXEL_SIZE, tile.y0 * PIXEL_SIZE, TILE * PIXEL_SIZE, TILE * PIXEL_SIZE);
+      ctx.drawImage(src, tile.x0 * PIXEL_SIZE - overlap, tile.y0 * PIXEL_SIZE - overlap, TILE * PIXEL_SIZE + overlap * 2, TILE * PIXEL_SIZE + overlap * 2);
     }
 
     // グリッドは分離レイヤーに描画（ピクセル上に見えるグリッド）
