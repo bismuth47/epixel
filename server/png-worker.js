@@ -121,6 +121,19 @@ async function processDirtyChunks(pgPool, supabase, opts = {}) {
     );
 
     if (rows.length === 0) {
+      // dirtyが無いときでも、過去のバグで残った stale delta（png_generated_at以前）を掃除
+      try {
+        const cleaned = await client.query(
+          `DELETE FROM canvas_pixel_deltas d
+           USING canvas_chunks c
+           WHERE d.chunk_x = c.chunk_x AND d.chunk_y = c.chunk_y
+             AND c.png_generated_at IS NOT NULL
+             AND d.created_at <= c.png_generated_at`
+        );
+        if (cleaned.rowCount > 0) console.log(`[png-worker] stale delta cleanup: ${cleaned.rowCount} rows`);
+      } catch (e) {
+        console.warn("[png-worker] stale cleanup failed:", e.message);
+      }
       return { processed: 0, skipped: 0, errors: 0 };
     }
 
@@ -154,15 +167,26 @@ async function processDirtyChunks(pgPool, supabase, opts = {}) {
           console.warn(`[png-worker] supabase not configured, skip storage upload for ${cx},${cy}`);
         }
 
-        // DBのメタ更新
-        await client.query(
+        // DBのメタ更新（RETURNINGで確定時刻を取得してdelta削除に利用）
+        const upd = await client.query(
           `UPDATE canvas_chunks
            SET png_generated_at = NOW(), png_etag = $1, png_storage_path = $2
-           WHERE chunk_x = $3 AND chunk_y = $4`,
+           WHERE chunk_x = $3 AND chunk_y = $4
+           RETURNING png_generated_at`,
           [etag, storagePathVal, cx, cy]
         );
+        const pngAt = upd.rows[0]?.png_generated_at;
 
-        // 古いdelta削除（TTL超え）
+        // PNGに吸収されたdeltaを削除（png_generated_at以前は不要）
+        // レース対策: 同時書き込みで created_at == png_generated_at のdeltaが消えないよう <= を使用
+        if (pngAt) {
+          await client.query(
+            `DELETE FROM canvas_pixel_deltas
+             WHERE chunk_x = $1 AND chunk_y = $2 AND created_at <= $3`,
+            [cx, cy, pngAt]
+          );
+        }
+        // 7日以上前の孤立deltaも念のため掃除（TTL）
         await client.query(
           `DELETE FROM canvas_pixel_deltas
            WHERE chunk_x = $1 AND chunk_y = $2 AND created_at < NOW() - INTERVAL '${DELTA_TTL_DAYS} days'`,
@@ -174,6 +198,20 @@ async function processDirtyChunks(pgPool, supabase, opts = {}) {
         console.error(`[png-worker] chunk ${cx},${cy} failed:`, e.message);
         errors++;
       }
+    }
+
+    // 今回処理した分以外にも残っている stale delta をまとめて掃除（dirtyでないchunkの過去残留分）
+    try {
+      const cleaned = await client.query(
+        `DELETE FROM canvas_pixel_deltas d
+         USING canvas_chunks c
+         WHERE d.chunk_x = c.chunk_x AND d.chunk_y = c.chunk_y
+           AND c.png_generated_at IS NOT NULL
+           AND d.created_at <= c.png_generated_at`
+      );
+      if (cleaned.rowCount > 0) console.log(`[png-worker] stale delta cleanup: ${cleaned.rowCount} rows`);
+    } catch (e) {
+      console.warn("[png-worker] stale cleanup failed:", e.message);
     }
 
     console.log(`[png-worker] tick done: processed=${processed} errors=${errors} totalDirty=${rows.length}`);
