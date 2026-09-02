@@ -1731,7 +1731,7 @@
         if(currentTool===TOOLS.DOT) showGhost = true;
         else if(currentTool===TOOLS.FILL) showGhost = true;
         else if(currentTool===TOOLS.PEN) showGhost = true;
-        else if(currentTool===TOOLS.RECT || currentTool===TOOLS.CIRCLE) showGhost = true;
+        else if(currentTool===TOOLS.RECT || currentTool===TOOLS.CIRCLE || currentTool===TOOLS.LINE) showGhost = true;
         else if(currentTool===TOOLS.SPoit) showGhost = true;
         if(!isToolAllowed(currentTool)) showGhost = false;
         if(showGhost){
