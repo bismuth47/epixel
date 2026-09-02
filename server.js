@@ -799,29 +799,36 @@ app.get("/api/chunks/:cx/:cy/png", async (req, res) => {
       if (!pngWorker) return res.status(503).json({ error: "png worker not available" });
       let pixels = [];
       let needGenerate = false;
+      let updatedAtIso = null;
       if (pgPool) {
         const c2 = await pgPool.connect();
         try {
-          const r2 = await c2.query(`SELECT data FROM ${CHUNK_TABLE} WHERE chunk_x=$1 AND chunk_y=$2`, [cx, cy]);
+          const r2 = await c2.query(`SELECT data, updated_at, png_generated_at FROM ${CHUNK_TABLE} WHERE chunk_x=$1 AND chunk_y=$2`, [cx, cy]);
           if (r2.rows[0] && r2.rows[0].data) {
             pixels = ChunkCodec.decode(bufferToUint8Array(r2.rows[0].data));
             needGenerate = true;
+            updatedAtIso = r2.rows[0].png_generated_at || r2.rows[0].updated_at;
           }
         } finally { c2.release(); }
       } else if (supabase) {
-        const { data: ch } = await supabase.from(CHUNK_TABLE).select("data").eq("chunk_x", cx).eq("chunk_y", cy).single();
+        const { data: ch } = await supabase.from(CHUNK_TABLE).select("data,updated_at,png_generated_at").eq("chunk_x", cx).eq("chunk_y", cy).single();
         if (ch && ch.data) {
           pixels = ChunkCodec.decode(bufferToUint8Array(ch.data));
           needGenerate = true;
+          updatedAtIso = ch.png_generated_at || ch.updated_at;
         }
       }
       if (!needGenerate) return res.status(404).json({ error: "no chunk" });
       const pngBuf = await pngWorker.renderChunkToPng(pixels, CHUNK_SIZE);
       const etag = `W/"${cx}-${cy}-${pngBuf.length}-${Date.now()}"`;
       if (req.headers["if-none-match"] === etag) return res.status(304).end();
+      // オンデマンドでもLast-Modifiedとサーバ時刻ヘッダを必ず付与してsince補正を可能にする
+      const genAt = updatedAtIso ? new Date(updatedAtIso) : new Date();
       res.set("ETag", etag);
       res.set("Cache-Control", "public, max-age=30, stale-while-revalidate=60");
       res.set("Content-Type", "image/png");
+      res.set("Last-Modified", genAt.toUTCString());
+      res.set("X-PNG-Generated-At", genAt.toISOString());
       return res.send(pngBuf);
     }
 
@@ -843,7 +850,10 @@ app.get("/api/chunks/:cx/:cy/png", async (req, res) => {
     res.set("ETag", etag);
     res.set("Cache-Control", "public, max-age=60, stale-while-revalidate=120");
     res.set("Content-Type", "image/png");
-    if (pngMeta.png_generated_at) res.set("Last-Modified", new Date(pngMeta.png_generated_at).toUTCString());
+    if (pngMeta.png_generated_at) {
+      res.set("Last-Modified", new Date(pngMeta.png_generated_at).toUTCString());
+      res.set("X-PNG-Generated-At", new Date(pngMeta.png_generated_at).toISOString());
+    }
     return res.send(Buffer.from(arrayBuf));
   } catch (e) {
     console.error("[png] error:", e.message);
@@ -992,7 +1002,7 @@ function isValidDrawBatch(payload) {
 // ---- Rate limit: 3 ops per 1000ms (all tools, per socket) ----
 const DRAW_LIMIT = 3;
 const DRAW_WINDOW_MS = 1000;
-const BATCH_LIMIT = 20; // pen drag emits many small batches; allow higher burst
+const BATCH_LIMIT = 80; // pen drag emits many small batches; allow 80Hz smooth stroke without "1秒に3回" false positive (120Hz screenでも余裕)
 const UNDO_LIMIT = 10;
 const UNDO_WINDOW_MS = 1000;
 const socketDrawTimes = new Map(); // socket.id -> number[] for single draw
@@ -1012,8 +1022,10 @@ function checkRateLimit(socket){
 }
 function checkBatchRateLimit(socket, payloadLen){
   const now = Date.now();
-  // large batch (rect/circle/line/fill commit) -> strict 2/sec, small pen drag -> 20/sec
-  const isLargeBatch = payloadLen > 10;
+  // large batch (rect/circle/line/fill commit) -> strict 3/sec, small pen drag -> 80/sec
+  // ペンは一筆で数十回の小バッチを送るため、10px閾値だと高速ドラッグで大バッチ扱いになり
+  // 1秒3回制限が一筆中に誤発動していた。閾値を30にしてペン中間バッチは小バッチ扱いにする
+  const isLargeBatch = payloadLen > 30;
   if(isLargeBatch){
     let times = socketDrawTimes.get(socket.id) || [];
     times = times.filter(t => now - t < DRAW_WINDOW_MS);

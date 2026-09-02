@@ -456,6 +456,7 @@
   const fetchingTiles = new Set();
   let fetchingCount = 0;
   const tilePngAt = new Map(); // "tx,ty" -> Last-Modified ISO string
+  let serverTimeOffset = 0; // serverTime - clientTime (ms), deltaのserverTimeで補正
   // RGB -> code reverse map for PNG decode
   const RGB_TO_CODE = new Map();
   (function(){ for(let i=0;i<CODE_TO_COLOR.length;i++){ const h=CODE_TO_COLOR[i]; const r=parseInt(h.slice(1,3),16),g=parseInt(h.slice(3,5),16),b=parseInt(h.slice(5,7),16); RGB_TO_CODE.set(`${r},${g},${b}`, i); } })();
@@ -1034,11 +1035,16 @@
       const url = `/api/delta?cx=${cx}&cy=${cy}&since=${encodeURIComponent(sinceIso)}`;
       const res = await fetch(url, { cache: "no-store" });
       if(!res.ok){
-        if(res.status===404) return 0;
+        if(res.status===404) return { count: 0, truncated: false };
         console.warn("[delta] failed", `${cx},${cy}`, res.status);
-        return 0;
+        return { count: 0, truncated: false };
       }
       const j = await res.json();
+      // サーバ時刻オフセットを更新（以降のsince補正に使用）
+      if(j.serverTime){
+        const st = new Date(j.serverTime).getTime();
+        if(!isNaN(st)) serverTimeOffset = st - Date.now();
+      }
       const deltas = j.deltas || [];
       for(const d of deltas){
         const gx = d.x, gy = d.y, color = d.color;
@@ -1048,8 +1054,23 @@
           if(col) setPixel(gx, gy, col);
         }
       }
-      return deltas.length;
-    }catch(e){ console.warn("[delta] error", e.message); return 0; }
+      return { count: deltas.length, truncated: !!j.truncated };
+    }catch(e){ console.warn("[delta] error", e.message); return { count: 0, truncated: false }; }
+  }
+  function clearTilePixels(cx, cy){
+    const key = `${cx},${cy}`;
+    const tmap = tilePixels.get(key);
+    if(tmap){
+      for(const k of tmap.keys()){
+        const comma = k.indexOf(',');
+        const gx = parseInt(k.slice(0, comma),10);
+        const gy = parseInt(k.slice(comma+1),10);
+        const col = pixels.get(gx);
+        if(col){ col.delete(gy); if(col.size===0) pixels.delete(gx); pixelCount--; }
+      }
+      tilePixels.delete(key);
+    }
+    markTileDirtyByKey(key);
   }
   async function fetchTileBinaryFallback(tile){
     const key = tile.key;
@@ -1106,20 +1127,46 @@
       let pngOk = false;
       try{
         const pngUrl = `/api/chunks/${cx}/${cy}/png`;
-        const pngRes = await fetch(pngUrl, { cache: "default" });
+        let pngRes = await fetch(pngUrl, { cache: "default" });
         if(pngRes.status === 304){
-          // キャッシュヒット: 前回のLast-Modifiedを流用してdeltaのみ取得
-          pngAtIso = tilePngAt.get(key) || new Date(0).toISOString();
-          pngOk = true; // PNG自体はキャッシュにある想定、再デコードは不要
-        } else if(pngRes.ok){
-          const lastMod = pngRes.headers.get("Last-Modified");
-          if(lastMod){
-            const d = new Date(lastMod);
-            pngAtIso = isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
-          } else {
-            // オンデマンド生成など Last-Modifiedが無い場合は ETag由来で now を使う
-            pngAtIso = new Date().toISOString();
+          // 304はbodyが空でデコードできない。HTTPキャッシュ頼みだとリロード時にベースが欠落する
+          // → reloadで実体を取得し直す（初回304でもベースを確実にデコード）
+          try{
+            const retry = await fetch(pngUrl, { cache: "reload" });
+            if(retry.ok || retry.status===404) pngRes = retry;
+            else {
+              // reloadでも304/失敗なら binary fallbackで補完
+              console.warn("[png] 304 reload failed", key, retry.status);
+              return await fetchTileBinaryFallback(tile);
+            }
+          }catch(e){
+            console.warn("[png] 304 retry error", key, e.message);
+            return await fetchTileBinaryFallback(tile);
           }
+        }
+        if(pngRes.ok){
+          // since補正: サーバ時刻を優先（X-PNG-Generated-At > Last-Modified > Dateヘッダ）
+          const pgAt = pngRes.headers.get("X-PNG-Generated-At");
+          const lastMod = pngRes.headers.get("Last-Modified");
+          const dateHdr = pngRes.headers.get("Date");
+          let iso = null;
+          if(pgAt){
+            const d = new Date(pgAt);
+            if(!isNaN(d.getTime())) iso = d.toISOString();
+          }
+          if(!iso && lastMod){
+            const d = new Date(lastMod);
+            if(!isNaN(d.getTime())) iso = d.toISOString();
+          }
+          if(!iso && dateHdr){
+            const d = new Date(dateHdr);
+            if(!isNaN(d.getTime())) iso = d.toISOString();
+          }
+          if(!iso){
+            // ヘッダ欠落時はサーバ時刻オフセット補正した現在時刻を使う（クライアント時計ずれ対策）
+            iso = new Date(Date.now() + serverTimeOffset).toISOString();
+          }
+          pngAtIso = iso;
           tilePngAt.set(key, pngAtIso);
           const blob = await pngRes.blob();
           // decode PNG → tilePixels
@@ -1149,11 +1196,39 @@
       }
       // ② 差分取得（PNG生成時刻以降）
       const sinceIso = pngAtIso || tilePngAt.get(key) || new Date(0).toISOString();
-      const deltaCount = await fetchDeltaSince(cx, cy, sinceIso);
+      const deltaRes = await fetchDeltaSince(cx, cy, sinceIso);
+      if(deltaRes.truncated){
+        console.warn("[delta] truncated >10000, fallback to binary", key);
+        // PNG+部分deltaでは不完全なので、バイナリ全体で再取得
+        clearTilePixels(cx, cy);
+        // fetchingTilesは既にセットされているため、binaryパスを直接実行（重複ガードを避ける）
+        const n = await (async()=>{
+          const url = `/api/chunks?cx=${cx}&cy=${cy}`;
+          let res = await fetch(url, { cache: "reload" });
+          if(res.status===404){ fetchedTiles.add(key); return 0; }
+          if(!res.ok){ console.warn("[fetchTile-binary-truncated] failed", key, res.status); fetchedTiles.add(key); return 0; }
+          const buf = await res.arrayBuffer();
+          const binary = new Uint8Array(buf);
+          const pxs = ChunkCodec.decode(binary);
+          const CHUNK = 2500;
+          for(let i=0;i<pxs.length;i+=CHUNK){
+            const slice = pxs.slice(i, i+CHUNK);
+            for(const p of slice){
+              const gx = cx * TILE + p.x;
+              const gy = cy * TILE + p.y;
+              setPixel(gx, gy, CODE_TO_COLOR[p.colorId]);
+            }
+            if(pxs.length > CHUNK && i+CHUNK < pxs.length) await new Promise(r=> requestAnimationFrame(()=>r()));
+          }
+          fetchedTiles.add(key);
+          return pxs.length;
+        })();
+        return n;
+      }
       fetchedTiles.add(key);
-      // base と delta 合計（概算で baseは不明のため deltaCountを返す、0でも描画はされる）
+      // base と delta 合計（概算で baseは不明のため deltaRes.countを返す、0でも描画はされる）
       // 正確なピクセル数は tilePixels から取得できるが、呼び出し元は total に使うだけ
-      return deltaCount;
+      return deltaRes.count;
     }catch(e){
       console.warn("[fetchTile] error", tile.key, e.message);
       return 0;

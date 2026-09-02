@@ -140,11 +140,13 @@ async function processDirtyChunks(pgPool, supabase, opts = {}) {
     console.log(`[png-worker] found ${rows.length} dirty chunks`);
 
     let processed = 0;
+    let skipped = 0;
     let errors = 0;
 
     for (const row of rows) {
       const cx = row.chunk_x;
       const cy = row.chunk_y;
+      const oldUpdatedAt = row.updated_at;
       try {
         const pixels = ChunkCodec.decode(bufferToUint8Array(row.data));
         const pngBuf = await renderChunkToPng(pixels, CHUNK_SIZE);
@@ -168,13 +170,20 @@ async function processDirtyChunks(pgPool, supabase, opts = {}) {
         }
 
         // DBのメタ更新（RETURNINGで確定時刻を取得してdelta削除に利用）
+        // レース対策: 同時書き込みでupdated_atが進んでいたらpng_generated_atを進めない
+        // → そのdeltaは次tickでPNGに含めてから削除する（タイムラグ埋めの欠落防止）
         const upd = await client.query(
           `UPDATE canvas_chunks
            SET png_generated_at = NOW(), png_etag = $1, png_storage_path = $2
-           WHERE chunk_x = $3 AND chunk_y = $4
+           WHERE chunk_x = $3 AND chunk_y = $4 AND updated_at = $5
            RETURNING png_generated_at`,
-          [etag, storagePathVal, cx, cy]
+          [etag, storagePathVal, cx, cy, oldUpdatedAt]
         );
+        if (upd.rowCount === 0) {
+          console.warn(`[png-worker] skip ${cx},${cy}: concurrent update detected (updated_at changed), retry next tick`);
+          skipped++;
+          continue;
+        }
         const pngAt = upd.rows[0]?.png_generated_at;
 
         // PNGに吸収されたdeltaを削除（png_generated_at以前は不要）
@@ -214,8 +223,8 @@ async function processDirtyChunks(pgPool, supabase, opts = {}) {
       console.warn("[png-worker] stale cleanup failed:", e.message);
     }
 
-    console.log(`[png-worker] tick done: processed=${processed} errors=${errors} totalDirty=${rows.length}`);
-    return { processed, skipped: 0, errors };
+    console.log(`[png-worker] tick done: processed=${processed} skipped=${skipped} errors=${errors} totalDirty=${rows.length}`);
+    return { processed, skipped, errors };
   } finally {
     client.release();
   }
